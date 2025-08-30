@@ -1,0 +1,55 @@
+--- Makefile.orig	2025-01-01 00:00:00.000000000 +0000
++++ Makefile	2025-01-01 00:00:00.000000000 +0000
+@@ -130,6 +130,26 @@
+ PARSER_GEN_HEADER = $(PARSER_BUILD_DIR)/$(SYNTAX_NAME).hh
+ GSIM_SRCS = $(foreach x, src $(PARSER_DIR), $(wildcard $(x)/*.cpp))
+ 
++##############################################
++### BSP Mode Support
++##############################################
++
++# Include BSP-specific makefile if BSP mode is enabled
++ifeq ($(BSP),1)
++    include Makefile.bsp
++    
++    # Add BSP-specific compiler flags
++    CXXFLAGS += -DBSP_MODE -DBSP_ENABLED -pthread
++    LDFLAGS += -lnuma -pthread
++    
++    # Enable profiling if requested
++    ifeq ($(BSP_PROFILING),1)
++        CXXFLAGS += -DBSP_PROFILING
++    endif
++    
++    # Add BSP info to build output
++    $(info BSP mode enabled with $(or $(BSP_THREADS),auto-detected) threads)
++endif
++
+ GSIM_INC_DIR = include $(PARSER_DIR)/include $(PARSER_BUILD_DIR)
+ CXXFLAGS += -ggdb -O3 -MMD $(addprefix -I,$(GSIM_INC_DIR)) -Wall -Werror --std=c++17
+ 
+@@ -163,6 +183,23 @@
+ 
+ .PHONY: build-gsim
+ 
++##############################################
++### BSP-specific targets
++##############################################
++
++.PHONY: bsp-help
++bsp-help:
++	@echo "BSP Mode Usage:"
++	@echo "  make BSP=1                    # Build with BSP support"
++	@echo "  make BSP=1 BSP_THREADS=8      # Specify thread count"
++	@echo "  make BSP=1 BSP_PROFILING=1    # Enable profiling"
++	@echo "  make bsp-info                 # Show BSP configuration"
++	@echo "  make bsp-benchmark            # Run performance benchmarks"
++	@echo "  make bsp-profile              # Run with profiling"
++	@echo ""
++	@echo "Environment variables:"
++	@echo "  BSP_NUM_THREADS    - Runtime thread count"
++	@echo "  BSP_COST_MODEL     - Path to cost model file"
++
+ ##############################################
+ ### EMU: generate other version's .h/.cpp
+ ##############################################

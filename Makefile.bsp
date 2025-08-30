@@ -1,0 +1,75 @@
+# BSP Mode Makefile Extension
+# Include this file in the main Makefile to enable BSP support
+
+# BSP-specific source files
+BSP_SRCS = src/bsp_executor.cpp \
+           src/hypergraph_partitioner.cpp \
+           src/graphPartitionBSP.cpp \
+           src/cppEmitterBSP.cpp \
+           src/mainBSP.cpp
+
+# BSP-specific includes
+BSP_INC_DIR = include
+
+# BSP-specific flags
+BSP_CXXFLAGS = -DBSP_MODE -pthread -lnuma
+
+# Check if BSP mode is enabled
+ifeq ($(BSP),1)
+    # Replace main.cpp with mainBSP.cpp
+    GSIM_SRCS := $(filter-out src/main.cpp,$(GSIM_SRCS))
+    GSIM_SRCS += $(BSP_SRCS)
+    
+    # Add BSP flags
+    CXXFLAGS += $(BSP_CXXFLAGS)
+    
+    # Add BSP-specific defines
+    CFLAGS_DUT += -DBSP_ENABLED
+    
+    # Optional: Set number of threads
+    ifdef BSP_THREADS
+        CFLAGS_DUT += -DBSP_NUM_THREADS=$(BSP_THREADS)
+    endif
+endif
+
+# KaHyPar library (needs to be installed separately)
+# Uncomment and adjust path when KaHyPar is available
+# KAHYPAR_DIR = /path/to/kahypar
+# KAHYPAR_INC = $(KAHYPAR_DIR)/include
+# KAHYPAR_LIB = $(KAHYPAR_DIR)/lib
+# 
+# ifeq ($(BSP),1)
+#     CXXFLAGS += -I$(KAHYPAR_INC)
+#     LDFLAGS += -L$(KAHYPAR_LIB) -lkahypar
+# endif
+
+# BSP-specific targets
+.PHONY: bsp-info bsp-clean
+
+bsp-info:
+	@echo "BSP Mode Configuration:"
+	@echo "  BSP=$(BSP)"
+	@echo "  BSP_THREADS=$(BSP_THREADS)"
+	@echo "  BSP_SRCS=$(BSP_SRCS)"
+	@echo "  Thread count: $(shell nproc)"
+	@echo "  NUMA nodes: $(shell numactl --show | grep nodebind | wc -w)"
+
+bsp-clean:
+	@rm -f $(GSIM_BUILD_DIR)/src/bsp_*.o
+	@rm -f $(GSIM_BUILD_DIR)/src/*BSP.o
+	@rm -f $(GSIM_BUILD_DIR)/src/hypergraph_*.o
+
+# Performance profiling for BSP mode
+bsp-profile: $(GSIM_BIN)
+	@echo "Running BSP profiling..."
+	perf record -g $(GSIM_BIN) $(GSIM_FLAGS) --bsp --threads=$(BSP_THREADS) $(EXAMPLE)
+	perf report
+
+# Benchmark different thread counts
+bsp-benchmark: $(GSIM_BIN)
+	@echo "BSP Performance Benchmark"
+	@for threads in 1 2 4 8 16; do \
+		echo "Testing with $$threads threads..."; \
+		BSP_NUM_THREADS=$$threads $(TIME) -f "Threads: $$threads, Time: %e seconds" \
+			$(GSIM_BIN) $(GSIM_FLAGS) --bsp $(EXAMPLE) > /dev/null; \
+	done
