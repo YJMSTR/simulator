@@ -8,10 +8,13 @@
 #include <cstddef>
 #include <cstdio>
 #include <cinttypes>
+#include <algorithm>
 #include <map>
 #include <set>
+#include <stack>
 #include <string>
 #include <utility>
+#include <vector>
 
 #define ACTIVE_WIDTH 8
 #define RESET_PER_FUNC 400
@@ -53,9 +56,25 @@ struct MtBoundaryInfo {
   std::set<std::string> clockNames;
   bool hasStateUpdate = false;
   bool hasMemoryWrite = false;
+  bool hasMemoryRead = false;
   bool hasReset = false;
+  bool hasAsyncReset = false;
+  bool hasActivateAllPath = false;
   bool hasExternal = false;
   bool hasSpecial = false;
+  bool hasUnknownNode = false;
+  bool hasUnknownOp = false;
+  bool hasArrayOrDynamicIndex = false;
+};
+
+struct MtTaskInfo {
+  MtBoundaryInfo boundary;
+  std::string taskKind;
+  std::vector<std::string> serialReasons;
+  bool isSource = false;
+  bool isSink = false;
+  int candidateCost = 0;
+  bool hasCandidateCost = false;
 };
 
 static const char* nodeTypeName(NodeType type) {
@@ -78,6 +97,29 @@ static const char* nodeTypeName(NodeType type) {
     case NODE_EXT: return "NODE_EXT";
   }
   return "NODE_UNKNOWN";
+}
+
+static bool isKnownNodeType(NodeType type) {
+  switch (type) {
+    case NODE_INVALID:
+    case NODE_REG_SRC:
+    case NODE_REG_DST:
+    case NODE_SPECIAL:
+    case NODE_INP:
+    case NODE_OUT:
+    case NODE_MEMORY:
+    case NODE_READER:
+    case NODE_WRITER:
+    case NODE_READWRITER:
+    case NODE_INFER:
+    case NODE_OTHERS:
+    case NODE_REG_RESET:
+    case NODE_EXT_IN:
+    case NODE_EXT_OUT:
+    case NODE_EXT:
+      return true;
+  }
+  return false;
 }
 
 static const char* superTypeName(SuperType type) {
@@ -133,6 +175,17 @@ static void dumpJsonStringArray(FILE* fp, const std::set<std::string>& values) {
   fprintf(fp, "]");
 }
 
+static void dumpJsonStringArray(FILE* fp, const std::vector<std::string>& values) {
+  fprintf(fp, "[");
+  bool first = true;
+  for (const std::string& value : values) {
+    if (!first) fprintf(fp, ", ");
+    first = false;
+    fprintf(fp, "\"%s\"", jsonEscape(value).c_str());
+  }
+  fprintf(fp, "]");
+}
+
 static void addCppIdIfExecutable(std::set<int>& ids, SuperNode* super) {
   if (super && super->cppId >= 0) ids.insert(super->cppId);
 }
@@ -150,28 +203,230 @@ static bool nodeHasMemoryWrite(Node* node) {
   return node->type == NODE_WRITER || node->type == NODE_READWRITER;
 }
 
-static MtBoundaryInfo collectMtBoundaryInfo(SuperNode* super) {
+static bool nodeHasMemoryRead(Node* node) {
+  return node->type == NODE_READER || node->type == NODE_READWRITER;
+}
+
+static void addSerialReason(std::vector<std::string>& reasons, const std::string& reason) {
+  if (std::find(reasons.begin(), reasons.end(), reason) == reasons.end()) {
+    reasons.push_back(reason);
+  }
+}
+
+static void visitMtENode(ENode* root, MtBoundaryInfo& info, int& cost) {
+  if (!root) return;
+  std::stack<ENode*> stack;
+  stack.push(root);
+  while (!stack.empty()) {
+    ENode* top = stack.top();
+    stack.pop();
+    if (!top) continue;
+
+    if (top->nodePtr) {
+      if (top->nodePtr->isArray()) info.hasArrayOrDynamicIndex = true;
+      if (!isKnownNodeType(top->nodePtr->type) || top->nodePtr->type == NODE_INVALID || top->nodePtr->type == NODE_INFER) {
+        info.hasUnknownNode = true;
+      }
+    } else {
+      switch (top->opType) {
+        case OP_EMPTY:
+        case OP_INT:
+        case OP_INDEX_INT:
+          break;
+        case OP_ADD:
+        case OP_SUB:
+        case OP_MUL:
+        case OP_DIV:
+        case OP_REM:
+        case OP_LT:
+        case OP_LEQ:
+        case OP_GT:
+        case OP_GEQ:
+        case OP_EQ:
+        case OP_NEQ:
+        case OP_DSHL:
+        case OP_DSHR:
+        case OP_AND:
+        case OP_OR:
+        case OP_XOR:
+        case OP_CAT:
+        case OP_ASUINT:
+        case OP_ASSINT:
+        case OP_ASCLOCK:
+        case OP_ASASYNCRESET:
+        case OP_CVT:
+        case OP_NEG:
+        case OP_NOT:
+        case OP_ANDR:
+        case OP_ORR:
+        case OP_XORR:
+        case OP_PAD:
+        case OP_SHL:
+        case OP_SHR:
+        case OP_HEAD:
+        case OP_TAIL:
+        case OP_BITS:
+        case OP_BITS_NOSHIFT:
+        case OP_MUX:
+        case OP_WHEN:
+        case OP_GROUP:
+        case OP_SEXT:
+        case OP_STMT_SEQ:
+        case OP_STMT_WHEN:
+        case OP_STMT_NODE:
+          cost ++;
+          break;
+        case OP_INDEX:
+          info.hasArrayOrDynamicIndex = true;
+          cost ++;
+          break;
+        case OP_READ_MEM:
+          info.hasMemoryRead = true;
+          cost ++;
+          break;
+        case OP_WRITE_MEM:
+        case OP_INFER_MEM:
+          info.hasMemoryWrite = true;
+          cost ++;
+          break;
+        case OP_RESET:
+          info.hasReset = true;
+          cost ++;
+          break;
+        case OP_PRINTF:
+        case OP_ASSERT:
+        case OP_EXIT:
+          info.hasSpecial = true;
+          cost ++;
+          break;
+        case OP_EXT_FUNC:
+          info.hasExternal = true;
+          cost ++;
+          break;
+        case OP_INVALID:
+        default:
+          info.hasUnknownOp = true;
+          break;
+      }
+    }
+
+    for (ENode* child : top->child) {
+      if (child) stack.push(child);
+    }
+  }
+}
+
+static MtBoundaryInfo collectMtBoundaryInfo(SuperNode* super, int& candidateCost) {
   MtBoundaryInfo info;
+  candidateCost = 0;
   info.hasStateUpdate = super->superType == SUPER_UPDATE_REG;
   info.hasReset = super->superType == SUPER_ASYNC_RESET || super->superType == SUPER_UINT_RESET;
+  info.hasAsyncReset = super->superType == SUPER_ASYNC_RESET;
   info.hasExternal = super->superType == SUPER_EXTMOD;
 
   for (Node* member : super->member) {
     info.nodeKinds[nodeTypeName(member->type)] ++;
     info.hasStateUpdate = info.hasStateUpdate || nodeHasStateUpdate(member);
     info.hasMemoryWrite = info.hasMemoryWrite || nodeHasMemoryWrite(member);
+    info.hasMemoryRead = info.hasMemoryRead || nodeHasMemoryRead(member);
     info.hasReset = info.hasReset || member->isReset() || member->type == NODE_REG_RESET;
+    info.hasAsyncReset = info.hasAsyncReset || member->isAsyncReset() || member->reset == ASYRESET;
     info.hasExternal = info.hasExternal || member->isExt();
     info.hasSpecial = info.hasSpecial || member->type == NODE_SPECIAL;
+    info.hasArrayOrDynamicIndex = info.hasArrayOrDynamicIndex || member->isArray();
+    if (!isKnownNodeType(member->type) || member->type == NODE_INVALID || member->type == NODE_INFER || member->type == NODE_MEMORY) {
+      info.hasUnknownNode = true;
+    }
     if (member->clock) info.clockNames.insert(member->clock->name);
+    for (ExpTree* tree : member->assignTree) {
+      visitMtENode(tree->getRoot(), info, candidateCost);
+      visitMtENode(tree->getlval(), info, candidateCost);
+    }
+    if (member->resetTree) {
+      visitMtENode(member->resetTree->getRoot(), info, candidateCost);
+      visitMtENode(member->resetTree->getlval(), info, candidateCost);
+    }
   }
 
   if (super->resetNode) {
     info.hasReset = true;
+    info.hasAsyncReset = info.hasAsyncReset || super->resetNode->isAsyncReset() || super->resetNode->reset == ASYRESET;
     if (super->resetNode->clock) info.clockNames.insert(super->resetNode->clock->name);
   }
 
+  info.hasActivateAllPath = info.hasAsyncReset;
   return info;
+}
+
+static MtTaskInfo classifyMtTask(SuperNode* super) {
+  MtTaskInfo task;
+  int candidateCost = 0;
+  task.boundary = collectMtBoundaryInfo(super, candidateCost);
+
+  if (super->superType != SUPER_VALID) {
+    addSerialReason(task.serialReasons, "super_type_" + std::string(superTypeName(super->superType)));
+  }
+  if (task.boundary.hasStateUpdate) addSerialReason(task.serialReasons, "state_update");
+  if (task.boundary.hasMemoryWrite) addSerialReason(task.serialReasons, "memory_write");
+  if (task.boundary.hasMemoryRead) addSerialReason(task.serialReasons, "memory_read_unsupported");
+  if (task.boundary.hasReset) addSerialReason(task.serialReasons, "reset");
+  if (task.boundary.hasAsyncReset) addSerialReason(task.serialReasons, "async_reset");
+  if (task.boundary.hasActivateAllPath) addSerialReason(task.serialReasons, "activate_all_path");
+  if (task.boundary.hasExternal) addSerialReason(task.serialReasons, "external");
+  if (task.boundary.hasSpecial) addSerialReason(task.serialReasons, "special");
+  if (task.boundary.hasUnknownNode) addSerialReason(task.serialReasons, "unknown_node");
+  if (task.boundary.hasUnknownOp) addSerialReason(task.serialReasons, "unknown_op");
+  if (task.boundary.hasArrayOrDynamicIndex) addSerialReason(task.serialReasons, "array_or_dynamic_index");
+
+  if (task.serialReasons.empty()) {
+    task.taskKind = "pure_compute";
+    task.hasCandidateCost = true;
+    task.candidateCost = std::max(1, candidateCost);
+  } else {
+    task.taskKind = "serial";
+  }
+  return task;
+}
+
+static std::map<int, MtTaskInfo> buildMtTaskInfoMap() {
+  std::map<int, MtTaskInfo> tasks;
+  for (int cppId = 0; cppId < superId; cppId ++) {
+    tasks[cppId] = classifyMtTask(cppId2Super[cppId]);
+  }
+
+  for (auto& iter : tasks) {
+    int cppId = iter.first;
+    MtTaskInfo& task = iter.second;
+    if (task.taskKind != "pure_compute") continue;
+
+    SuperNode* super = cppId2Super[cppId];
+    bool hasPred = false;
+    bool hasSucc = false;
+    auto checkPred = [&](SuperNode* pred) {
+      if (!pred || pred->cppId < 0) return;
+      hasPred = true;
+      if (tasks[pred->cppId].taskKind == "serial") task.isSource = true;
+    };
+    auto checkSucc = [&](SuperNode* succ) {
+      if (!succ || succ->cppId < 0) return;
+      hasSucc = true;
+      if (tasks[succ->cppId].taskKind == "serial") task.isSink = true;
+    };
+    for (SuperNode* pred : super->prev) checkPred(pred);
+    for (SuperNode* pred : super->depPrev) checkPred(pred);
+    for (SuperNode* succ : super->next) checkSucc(succ);
+    for (SuperNode* succ : super->depNext) checkSucc(succ);
+    for (Node* member : super->member) {
+      for (int activeId : member->nextNeedActivate) {
+        if (activeId < 0) continue;
+        hasSucc = true;
+        if (tasks[activeId].taskKind == "serial") task.isSink = true;
+      }
+    }
+    if (!hasPred) task.isSource = true;
+    if (!hasSucc) task.isSink = true;
+  }
+  return tasks;
 }
 
 void graph::dumpMtScheduleJson() {
@@ -179,6 +434,7 @@ void graph::dumpMtScheduleJson() {
   std::string path = globalConfig.OutputDir + "/" + baseName + "_mt_schedule.json";
   FILE* fp = std::fopen(path.c_str(), "w");
   Assert(fp != nullptr, "failed to open mt schedule json %s", path.c_str());
+  std::map<int, MtTaskInfo> mtTasks = buildMtTaskInfoMap();
 
   fprintf(fp, "{\n");
   fprintf(fp, "  \"format\": \"gsim.mt-schedule.v1\",\n");
@@ -190,7 +446,8 @@ void graph::dumpMtScheduleJson() {
     uint64_t activeMask;
     std::tie(activeWord, activeMask) = setIdxMask(cppId);
 
-    MtBoundaryInfo boundary = collectMtBoundaryInfo(super);
+    MtTaskInfo& mtTask = mtTasks[cppId];
+    const MtBoundaryInfo& boundary = mtTask.boundary;
     std::set<int> predCppIds;
     std::set<int> succCppIds;
     std::set<int> activeFanout;
@@ -211,6 +468,10 @@ void graph::dumpMtScheduleJson() {
     fprintf(fp, "      \"scan_index\": %d,\n", cppId);
     fprintf(fp, "      \"super_id\": %d,\n", super->id);
     fprintf(fp, "      \"super_type\": \"%s\",\n", superTypeName(super->superType));
+    fprintf(fp, "      \"task_kind\": \"%s\",\n", mtTask.taskKind.c_str());
+    fprintf(fp, "      \"serial_reasons\": ");
+    dumpJsonStringArray(fp, mtTask.serialReasons);
+    fprintf(fp, ",\n");
     fprintf(fp, "      \"active_word\": %d,\n", activeWord);
     fprintf(fp, "      \"active_mask\": \"0x%" PRIx64 "\",\n", activeMask);
     fprintf(fp, "      \"node_kinds\": {");
@@ -243,9 +504,13 @@ void graph::dumpMtScheduleJson() {
     fprintf(fp, "\n");
     fprintf(fp, "      },\n");
     fprintf(fp, "      \"repcut\": {\n");
-    fprintf(fp, "        \"is_source\": false,\n");
-    fprintf(fp, "        \"is_sink\": false,\n");
-    fprintf(fp, "        \"candidate_cost\": null\n");
+    fprintf(fp, "        \"is_source\": %s,\n", mtTask.isSource ? "true" : "false");
+    fprintf(fp, "        \"is_sink\": %s,\n", mtTask.isSink ? "true" : "false");
+    if (mtTask.hasCandidateCost) {
+      fprintf(fp, "        \"candidate_cost\": %d\n", mtTask.candidateCost);
+    } else {
+      fprintf(fp, "        \"candidate_cost\": null\n");
+    }
     fprintf(fp, "      }\n");
     fprintf(fp, "    }%s\n", cppId + 1 == superId ? "" : ",");
   }
@@ -831,6 +1096,56 @@ int graph::genActivate() {
     return nextSubStepIdx - 1; // return the maxinum subStepIdx currently used
 }
 
+void graph::genMtTaskHelper(SuperNode* super) {
+  emitFuncDecl(0, "void S%s::mtTask%d(uint%d_t &flag) {\n", name.c_str(), super->cppId, ACTIVE_WIDTH);
+  genSuperEval(super, "flag", 1);
+  emitBodyLock(0, "}\n");
+}
+
+int graph::genActivateSeqHelpers() {
+    for (int idx = 0; idx < superId; idx ++) {
+      genMtTaskHelper(cppId2Super[idx]);
+    }
+
+    emitFuncDecl(0, "void S%s::subStep0() {\n", name.c_str());
+    int indent = 1;
+    int nextSubStepIdx = 1;
+    std::string nextFuncDef = format("void S%s::subStep%d()", name.c_str(), nextSubStepIdx);
+    bool prevActiveWhole = false;
+    for (int idx = 0; idx < superId; idx ++) {
+      int id;
+      uint64_t mask;
+      std::tie(id, mask) = setIdxMask(idx);
+      int offset = idx % ACTIVE_WIDTH;
+      if (offset == 0) {
+        if (prevActiveWhole) {
+          emitBodyLock(--indent, "}\n");
+        }
+        prevActiveWhole = true;
+        for (int j = 0; j < ACTIVE_WIDTH && idx + j < superId; j ++) {
+          if (isAlwaysActive(idx + j)) prevActiveWhole = false;
+        }
+        if (prevActiveWhole) {
+          bool newFile = __emitSrc(indent ++, true, false, nextFuncDef.c_str(), "if(unlikely(activeFlags[%d] != 0)) {\n", id);
+          if (newFile) {
+            nextFuncDef = format("void S%s::subStep%d()", name.c_str(), ++ nextSubStepIdx);
+          }
+          emitBodyLock(indent, "uint%d_t oldFlag = activeFlags[%d];\n", ACTIVE_WIDTH, id);
+          emitBodyLock(indent, "activeFlags[%d] = 0;\n", id);
+        }
+      }
+      SuperNode* super = cppId2Super[idx];
+      std::string flagName = prevActiveWhole ? "oldFlag" : format("activeFlags[%d]", id);
+      indent = genNodeStepStart(super, mask, idx, flagName, indent);
+      emitBodyLock(indent, "mtTask%d(%s);\n", idx, flagName.c_str());
+      indent = genNodeStepEnd(super, indent);
+    }
+    emitBodyLock(--indent, "}\n");
+    if (prevActiveWhole) emitBodyLock(--indent, "}\n");
+
+    return nextSubStepIdx - 1;
+}
+
 void graph::genResetDef(SuperNode* super, bool isUIntReset, int indent) {
   emitBodyLock(indent ++, "void S%s::subReset%d(){ // %s reset\n", name.c_str(), resetFuncNum, isUIntReset ? "uint" : "async");
   if (super2ResetId.find(super->resetNode) != super2ResetId.end()) {
@@ -1119,9 +1434,14 @@ void graph::cppEmitter() {
   }
 
   /* main evaluation loop (step) */
-  int subStepIdxMax = genActivate();
+  int subStepIdxMax = globalConfig.MtHelperMode == "seq" ? genActivateSeqHelpers() : genActivate();
   for (int i = 0; i <= subStepIdxMax; i ++) {
     fprintf(header, "void subStep%d();\n", i);
+  }
+  if (globalConfig.MtHelperMode == "seq") {
+    for (int i = 0; i < superId; i ++) {
+      fprintf(header, "void mtTask%d(uint%d_t &flag);\n", i, ACTIVE_WIDTH);
+    }
   }
 
   /* step wrapper */

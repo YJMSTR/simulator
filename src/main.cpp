@@ -9,6 +9,7 @@
 #include "graph.h"
 
 #include <sstream>
+#include <string>
 #include <getopt.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
@@ -39,6 +40,7 @@ Config::Config() {
   DumpAssignTree = false;
   DumpConstStatus = false;
   DumpMtScheduleJson = false;
+  MtHelperMode = "off";
   OutputDir = ".";
   InputBaseName = "";
   SuperNodeMaxSize = 35;
@@ -127,6 +129,7 @@ static void printUsage(const char* ProgName) {
             << "      --dump-assign-tree           Include assignTree structure in JSON dump (can be large).\n"
             << "      --dump-const-status          Dump per-node constant-analysis status before removing constants.\n"
             << "      --dump-mt-schedule-json      Dump gsim-mt schedule metadata JSON without changing generated model behavior.\n"
+            << "      --mt-helper-mode=off|seq     Emit gsim-mt per-super helpers; off is the default.\n"
             ;
 }
 
@@ -156,6 +159,7 @@ static char* parseCommandLine(int argc, char** argv) {
     OPT_DUMP_ASSIGN_TREE,
     OPT_DUMP_CONST_STATUS,
     OPT_DUMP_MT_SCHEDULE_JSON,
+    OPT_MT_HELPER_MODE,
   };
 
   const struct option Table[] = {
@@ -176,6 +180,7 @@ static char* parseCommandLine(int argc, char** argv) {
       {"dump-assign-tree", no_argument, nullptr, 0},
       {"dump-const-status", no_argument, nullptr, 0},
       {"dump-mt-schedule-json", no_argument, nullptr, 0},
+      {"mt-helper-mode", required_argument, nullptr, 0},
       {nullptr, no_argument, nullptr, 0},
   };
 
@@ -238,6 +243,16 @@ static char* parseCommandLine(int argc, char** argv) {
                   break;
                 case OPT_DUMP_MT_SCHEDULE_JSON:
                   globalConfig.DumpMtScheduleJson = true;
+                  break;
+                case OPT_MT_HELPER_MODE:
+                  globalConfig.MtHelperMode = optarg;
+                  if (globalConfig.MtHelperMode != "off" && globalConfig.MtHelperMode != "seq") {
+                    fprintf(stderr, "Error: unknown --mt-helper-mode '%s' (expected off or seq).\n", optarg);
+                    printUsage(argv[0]);
+                    std::cout.flush();
+                    fflush(nullptr);
+                    _exit(EXIT_FAILURE);
+                  }
                   break;
                 default: printUsage(argv[0]); std::cout.flush(); fflush(nullptr); _exit(EXIT_SUCCESS);
               }

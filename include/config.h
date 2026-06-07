@@ -8,6 +8,7 @@ struct Config {
   bool DumpAssignTree;
   bool DumpConstStatus;
   bool DumpMtScheduleJson;
+  std::string MtHelperMode;
   std::string OutputDir;
   std::string InputBaseName;
   int SuperNodeMaxSize;

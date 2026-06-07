@@ -19,6 +19,23 @@ REQUIRED_REPCUT_FIELDS = {
     "candidate_cost",
 }
 
+VALID_TASK_KINDS = {"pure_compute", "serial"}
+PURE_FORBIDDEN_NODE_KINDS = {
+    "NODE_INVALID",
+    "NODE_REG_DST",
+    "NODE_SPECIAL",
+    "NODE_MEMORY",
+    "NODE_READER",
+    "NODE_WRITER",
+    "NODE_READWRITER",
+    "NODE_INFER",
+    "NODE_REG_RESET",
+    "NODE_EXT_IN",
+    "NODE_EXT_OUT",
+    "NODE_EXT",
+}
+
+
 def fail(message):
     print(f"mt-schedule-json check failed: {message}", file=sys.stderr)
     sys.exit(1)
@@ -65,6 +82,8 @@ def main():
             "scan_index",
             "super_id",
             "super_type",
+            "task_kind",
+            "serial_reasons",
             "active_word",
             "active_mask",
             "node_kinds",
@@ -84,6 +103,14 @@ def main():
         expect(task["cpp_id"] == scan_index, f"{path_prefix}.cpp_id must match scan order for milestone 01")
         expect(isinstance(task["super_id"], int) and task["super_id"] > 0, f"{path_prefix}.super_id must be positive int")
         expect(isinstance(task["super_type"], str) and task["super_type"], f"{path_prefix}.super_type must be string")
+        expect(task["task_kind"] in VALID_TASK_KINDS, f"{path_prefix}.task_kind must be one of {sorted(VALID_TASK_KINDS)}")
+        expect(isinstance(task["serial_reasons"], list), f"{path_prefix}.serial_reasons must be list")
+        for reason_index, reason in enumerate(task["serial_reasons"]):
+            expect(isinstance(reason, str) and reason, f"{path_prefix}.serial_reasons[{reason_index}] must be non-empty string")
+        if task["task_kind"] == "serial":
+            expect(task["serial_reasons"], f"{path_prefix}.serial_reasons must not be empty for serial task")
+        else:
+            expect(not task["serial_reasons"], f"{path_prefix}.serial_reasons must be empty for pure_compute task")
         expect(isinstance(task["active_word"], int) and task["active_word"] >= 0, f"{path_prefix}.active_word must be non-negative int")
         expect(isinstance(task["active_mask"], str) and task["active_mask"].startswith("0x"), f"{path_prefix}.active_mask must be hex string")
         int(task["active_mask"], 16)
@@ -94,6 +121,12 @@ def main():
         for name, count in node_kinds.items():
             expect(isinstance(name, str) and name.startswith("NODE_"), f"{path_prefix}.node_kinds key must be node kind")
             expect(isinstance(count, int) and count > 0, f"{path_prefix}.node_kinds[{name}] must be positive int")
+        if task["task_kind"] == "pure_compute":
+            expect(task["super_type"] == "SUPER_VALID",
+                   f"{path_prefix}.task_kind pure_compute requires SUPER_VALID")
+            forbidden_kinds = sorted(set(node_kinds).intersection(PURE_FORBIDDEN_NODE_KINDS))
+            expect(not forbidden_kinds,
+                   f"{path_prefix}.task_kind pure_compute has forbidden node kinds {forbidden_kinds}")
 
         for field in ("pred_cpp_ids", "succ_cpp_ids", "active_fanout"):
             values = task[field]
@@ -116,14 +149,23 @@ def main():
         saw_state_update = saw_state_update or boundary["has_state_update"]
         saw_reset = saw_reset or boundary["has_reset"]
         saw_clock = saw_clock or bool(boundary["clock_names"])
+        if task["task_kind"] == "pure_compute":
+            for field in ("has_state_update", "has_memory_write", "has_reset", "has_external", "has_special"):
+                expect(not boundary[field], f"{path_prefix}.task_kind pure_compute requires boundary.{field}=false")
 
         repcut = task["repcut"]
         expect(isinstance(repcut, dict), f"{path_prefix}.repcut must be object")
         expect(REQUIRED_REPCUT_FIELDS.issubset(repcut), f"{path_prefix}.repcut missing required fields")
         expect_bool(repcut, "is_source", f"{path_prefix}.repcut")
         expect_bool(repcut, "is_sink", f"{path_prefix}.repcut")
-        expect(repcut["candidate_cost"] is None,
-               f"{path_prefix}.repcut.candidate_cost must be null before classifier")
+        expect(repcut["candidate_cost"] is None or isinstance(repcut["candidate_cost"], int),
+               f"{path_prefix}.repcut.candidate_cost must be null or int")
+        if task["task_kind"] == "pure_compute":
+            expect(isinstance(repcut["candidate_cost"], int) and repcut["candidate_cost"] >= 0,
+                   f"{path_prefix}.repcut.candidate_cost must be non-negative int for pure_compute")
+        else:
+            expect(repcut["candidate_cost"] is None,
+                   f"{path_prefix}.repcut.candidate_cost must be null for serial task")
 
     for path_prefix, field, values in edge_refs:
         for value in values:
