@@ -83,6 +83,7 @@ class graph {
   void topoSort();
   void instsGenerator();
   void cppEmitter();
+  void dumpMtScheduleJson();
   void usedBits();
   void traversal();
   void traversalNoTree();

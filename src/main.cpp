@@ -38,7 +38,9 @@ Config::Config() {
   DumpGraphJson = false;
   DumpAssignTree = false;
   DumpConstStatus = false;
+  DumpMtScheduleJson = false;
   OutputDir = ".";
+  InputBaseName = "";
   SuperNodeMaxSize = 35;
   cppMaxSizeKB = -1;
   sep_module = "$";
@@ -61,6 +63,15 @@ static std::set<std::string> parseStageList(const std::string& arg) {
 
 static inline bool shouldDumpStage(const std::string& name) {
   return globalConfig.DumpStages.empty() || globalConfig.DumpStages.count(name);
+}
+
+static std::string basenameNoExt(const char* path) {
+  std::string name(path);
+  size_t slash = name.find_last_of("/");
+  if (slash != std::string::npos) name = name.substr(slash + 1);
+  size_t dot = name.find_last_of('.');
+  if (dot != std::string::npos) name = name.substr(0, dot);
+  return name;
 }
 
 
@@ -115,6 +126,7 @@ static void printUsage(const char* ProgName) {
             << "      --dump-stages=a,b,c          Dump only the listed stages (e.g., Init,TopoSort,AliasAnalysis).\n"
             << "      --dump-assign-tree           Include assignTree structure in JSON dump (can be large).\n"
             << "      --dump-const-status          Dump per-node constant-analysis status before removing constants.\n"
+            << "      --dump-mt-schedule-json      Dump gsim-mt schedule metadata JSON without changing generated model behavior.\n"
             ;
 }
 
@@ -143,6 +155,7 @@ static char* parseCommandLine(int argc, char** argv) {
     OPT_DUMP_STAGES,
     OPT_DUMP_ASSIGN_TREE,
     OPT_DUMP_CONST_STATUS,
+    OPT_DUMP_MT_SCHEDULE_JSON,
   };
 
   const struct option Table[] = {
@@ -162,6 +175,7 @@ static char* parseCommandLine(int argc, char** argv) {
       {"dump-stages", required_argument, nullptr, 0},
       {"dump-assign-tree", no_argument, nullptr, 0},
       {"dump-const-status", no_argument, nullptr, 0},
+      {"dump-mt-schedule-json", no_argument, nullptr, 0},
       {nullptr, no_argument, nullptr, 0},
   };
 
@@ -222,10 +236,15 @@ static char* parseCommandLine(int argc, char** argv) {
                 case OPT_DUMP_CONST_STATUS:
                   globalConfig.DumpConstStatus = true;
                   break;
+                case OPT_DUMP_MT_SCHEDULE_JSON:
+                  globalConfig.DumpMtScheduleJson = true;
+                  break;
                 default: printUsage(argv[0]); std::cout.flush(); fflush(nullptr); _exit(EXIT_SUCCESS);
               }
               break;
-      case 1: return optarg; // InputFileName
+      case 1:
+        globalConfig.InputBaseName = basenameNoExt(optarg);
+        return optarg; // InputFileName
       case 'd':
         globalConfig.EnableDumpGraph = true;
         globalConfig.DumpGraphDot = true;

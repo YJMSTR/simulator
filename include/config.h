@@ -7,7 +7,9 @@ struct Config {
   bool DumpGraphJson;
   bool DumpAssignTree;
   bool DumpConstStatus;
+  bool DumpMtScheduleJson;
   std::string OutputDir;
+  std::string InputBaseName;
   int SuperNodeMaxSize;
   uint32_t cppMaxSizeKB;
   std::string sep_module;

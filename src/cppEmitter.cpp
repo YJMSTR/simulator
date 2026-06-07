@@ -7,7 +7,9 @@
 
 #include <cstddef>
 #include <cstdio>
+#include <cinttypes>
 #include <map>
+#include <set>
 #include <string>
 #include <utility>
 
@@ -40,9 +42,218 @@ static std::map<Node*, std::pair<int, int>> super2ResetId;  // uint & async rese
 extern int maxConcatNum;
 bool nameExist(std::string str);
 static int resetFuncNum = 0;
+std::pair<int, uint64_t> setIdxMask(int cppId);
 
 static bool isAlwaysActive(int cppId) {
   return alwaysActive.find(cppId) != alwaysActive.end();
+}
+
+struct MtBoundaryInfo {
+  std::map<std::string, int> nodeKinds;
+  std::set<std::string> clockNames;
+  bool hasStateUpdate = false;
+  bool hasMemoryWrite = false;
+  bool hasReset = false;
+  bool hasExternal = false;
+  bool hasSpecial = false;
+};
+
+static const char* nodeTypeName(NodeType type) {
+  switch (type) {
+    case NODE_INVALID: return "NODE_INVALID";
+    case NODE_REG_SRC: return "NODE_REG_SRC";
+    case NODE_REG_DST: return "NODE_REG_DST";
+    case NODE_SPECIAL: return "NODE_SPECIAL";
+    case NODE_INP: return "NODE_INP";
+    case NODE_OUT: return "NODE_OUT";
+    case NODE_MEMORY: return "NODE_MEMORY";
+    case NODE_READER: return "NODE_READER";
+    case NODE_WRITER: return "NODE_WRITER";
+    case NODE_READWRITER: return "NODE_READWRITER";
+    case NODE_INFER: return "NODE_INFER";
+    case NODE_OTHERS: return "NODE_OTHERS";
+    case NODE_REG_RESET: return "NODE_REG_RESET";
+    case NODE_EXT_IN: return "NODE_EXT_IN";
+    case NODE_EXT_OUT: return "NODE_EXT_OUT";
+    case NODE_EXT: return "NODE_EXT";
+  }
+  return "NODE_UNKNOWN";
+}
+
+static const char* superTypeName(SuperType type) {
+  switch (type) {
+    case SUPER_VALID: return "SUPER_VALID";
+    case SUPER_EXTMOD: return "SUPER_EXTMOD";
+    case SUPER_ASYNC_RESET: return "SUPER_ASYNC_RESET";
+    case SUPER_UINT_RESET: return "SUPER_UINT_RESET";
+    case SUPER_UPDATE_REG: return "SUPER_UPDATE_REG";
+  }
+  return "SUPER_UNKNOWN";
+}
+
+static std::string jsonEscape(const std::string& str) {
+  std::string ret;
+  for (char ch : str) {
+    switch (ch) {
+      case '\\': ret += "\\\\"; break;
+      case '"': ret += "\\\""; break;
+      case '\b': ret += "\\b"; break;
+      case '\f': ret += "\\f"; break;
+      case '\n': ret += "\\n"; break;
+      case '\r': ret += "\\r"; break;
+      case '\t': ret += "\\t"; break;
+      default:
+        if (static_cast<unsigned char>(ch) < 0x20) ret += format("\\u%04x", ch);
+        else ret += ch;
+        break;
+    }
+  }
+  return ret;
+}
+
+static void dumpJsonIntArray(FILE* fp, const std::set<int>& values) {
+  fprintf(fp, "[");
+  bool first = true;
+  for (int value : values) {
+    if (!first) fprintf(fp, ", ");
+    first = false;
+    fprintf(fp, "%d", value);
+  }
+  fprintf(fp, "]");
+}
+
+static void dumpJsonStringArray(FILE* fp, const std::set<std::string>& values) {
+  fprintf(fp, "[");
+  bool first = true;
+  for (const std::string& value : values) {
+    if (!first) fprintf(fp, ", ");
+    first = false;
+    fprintf(fp, "\"%s\"", jsonEscape(value).c_str());
+  }
+  fprintf(fp, "]");
+}
+
+static void addCppIdIfExecutable(std::set<int>& ids, SuperNode* super) {
+  if (super && super->cppId >= 0) ids.insert(super->cppId);
+}
+
+static void addCppIdsIfExecutable(std::set<int>& ids, const std::set<SuperNode*>& supers) {
+  for (SuperNode* super : supers) addCppIdIfExecutable(ids, super);
+}
+
+static bool nodeHasStateUpdate(Node* node) {
+  return node->type == NODE_REG_DST || node->type == NODE_REG_RESET ||
+         (node->type == NODE_REG_SRC && node->regNext && node->regNext->status == VALID_NODE);
+}
+
+static bool nodeHasMemoryWrite(Node* node) {
+  return node->type == NODE_WRITER || node->type == NODE_READWRITER;
+}
+
+static MtBoundaryInfo collectMtBoundaryInfo(SuperNode* super) {
+  MtBoundaryInfo info;
+  info.hasStateUpdate = super->superType == SUPER_UPDATE_REG;
+  info.hasReset = super->superType == SUPER_ASYNC_RESET || super->superType == SUPER_UINT_RESET;
+  info.hasExternal = super->superType == SUPER_EXTMOD;
+
+  for (Node* member : super->member) {
+    info.nodeKinds[nodeTypeName(member->type)] ++;
+    info.hasStateUpdate = info.hasStateUpdate || nodeHasStateUpdate(member);
+    info.hasMemoryWrite = info.hasMemoryWrite || nodeHasMemoryWrite(member);
+    info.hasReset = info.hasReset || member->isReset() || member->type == NODE_REG_RESET;
+    info.hasExternal = info.hasExternal || member->isExt();
+    info.hasSpecial = info.hasSpecial || member->type == NODE_SPECIAL;
+    if (member->clock) info.clockNames.insert(member->clock->name);
+  }
+
+  if (super->resetNode) {
+    info.hasReset = true;
+    if (super->resetNode->clock) info.clockNames.insert(super->resetNode->clock->name);
+  }
+
+  return info;
+}
+
+void graph::dumpMtScheduleJson() {
+  std::string baseName = globalConfig.InputBaseName.empty() ? name : globalConfig.InputBaseName;
+  std::string path = globalConfig.OutputDir + "/" + baseName + "_mt_schedule.json";
+  FILE* fp = std::fopen(path.c_str(), "w");
+  Assert(fp != nullptr, "failed to open mt schedule json %s", path.c_str());
+
+  fprintf(fp, "{\n");
+  fprintf(fp, "  \"format\": \"gsim.mt-schedule.v1\",\n");
+  fprintf(fp, "  \"tasks\": [\n");
+
+  for (int cppId = 0; cppId < superId; cppId ++) {
+    SuperNode* super = cppId2Super[cppId];
+    int activeWord;
+    uint64_t activeMask;
+    std::tie(activeWord, activeMask) = setIdxMask(cppId);
+
+    MtBoundaryInfo boundary = collectMtBoundaryInfo(super);
+    std::set<int> predCppIds;
+    std::set<int> succCppIds;
+    std::set<int> activeFanout;
+
+    addCppIdsIfExecutable(predCppIds, super->prev);
+    addCppIdsIfExecutable(predCppIds, super->depPrev);
+    addCppIdsIfExecutable(succCppIds, super->next);
+    addCppIdsIfExecutable(succCppIds, super->depNext);
+
+    for (Node* member : super->member) {
+      for (int nextCppId : member->nextNeedActivate) {
+        if (nextCppId >= 0) activeFanout.insert(nextCppId);
+      }
+    }
+
+    fprintf(fp, "    {\n");
+    fprintf(fp, "      \"cpp_id\": %d,\n", cppId);
+    fprintf(fp, "      \"scan_index\": %d,\n", cppId);
+    fprintf(fp, "      \"super_id\": %d,\n", super->id);
+    fprintf(fp, "      \"super_type\": \"%s\",\n", superTypeName(super->superType));
+    fprintf(fp, "      \"active_word\": %d,\n", activeWord);
+    fprintf(fp, "      \"active_mask\": \"0x%" PRIx64 "\",\n", activeMask);
+    fprintf(fp, "      \"node_kinds\": {");
+    bool firstKind = true;
+    for (auto iter : boundary.nodeKinds) {
+      if (!firstKind) fprintf(fp, ", ");
+      firstKind = false;
+      fprintf(fp, "\"%s\": %d", iter.first.c_str(), iter.second);
+    }
+    fprintf(fp, "},\n");
+
+    fprintf(fp, "      \"pred_cpp_ids\": ");
+    dumpJsonIntArray(fp, predCppIds);
+    fprintf(fp, ",\n");
+    fprintf(fp, "      \"succ_cpp_ids\": ");
+    dumpJsonIntArray(fp, succCppIds);
+    fprintf(fp, ",\n");
+    fprintf(fp, "      \"active_fanout\": ");
+    dumpJsonIntArray(fp, activeFanout);
+    fprintf(fp, ",\n");
+
+    fprintf(fp, "      \"boundary\": {\n");
+    fprintf(fp, "        \"has_state_update\": %s,\n", boundary.hasStateUpdate ? "true" : "false");
+    fprintf(fp, "        \"has_memory_write\": %s,\n", boundary.hasMemoryWrite ? "true" : "false");
+    fprintf(fp, "        \"has_reset\": %s,\n", boundary.hasReset ? "true" : "false");
+    fprintf(fp, "        \"has_external\": %s,\n", boundary.hasExternal ? "true" : "false");
+    fprintf(fp, "        \"has_special\": %s,\n", boundary.hasSpecial ? "true" : "false");
+    fprintf(fp, "        \"clock_names\": ");
+    dumpJsonStringArray(fp, boundary.clockNames);
+    fprintf(fp, "\n");
+    fprintf(fp, "      },\n");
+    fprintf(fp, "      \"repcut\": {\n");
+    fprintf(fp, "        \"is_source\": false,\n");
+    fprintf(fp, "        \"is_sink\": false,\n");
+    fprintf(fp, "        \"candidate_cost\": null\n");
+    fprintf(fp, "      }\n");
+    fprintf(fp, "    }%s\n", cppId + 1 == superId ? "" : ",");
+  }
+
+  fprintf(fp, "  ]\n");
+  fprintf(fp, "}\n");
+  fclose(fp);
+  printf("[mt-schedule] wrote %d tasks to %s\n", superId, path.c_str());
 }
 
 std::pair<int, int> cppId2flagIdx(int cppId) {
@@ -799,6 +1010,7 @@ void graph::cppEmitter() {
       }
     }
   }
+  if (globalConfig.DumpMtScheduleJson) dumpMtScheduleJson();
 
   srcFp = NULL;
   srcFileIdx = 0;

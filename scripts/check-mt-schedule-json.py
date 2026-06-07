@@ -1,0 +1,141 @@
+#!/usr/bin/env python3
+import json
+import sys
+from pathlib import Path
+
+
+REQUIRED_BOUNDARY_FIELDS = {
+    "has_state_update",
+    "has_memory_write",
+    "has_reset",
+    "has_external",
+    "has_special",
+    "clock_names",
+}
+
+REQUIRED_REPCUT_FIELDS = {
+    "is_source",
+    "is_sink",
+    "candidate_cost",
+}
+
+def fail(message):
+    print(f"mt-schedule-json check failed: {message}", file=sys.stderr)
+    sys.exit(1)
+
+
+def expect(condition, message):
+    if not condition:
+        fail(message)
+
+
+def expect_bool(obj, field, path):
+    expect(field in obj, f"missing {path}.{field}")
+    expect(isinstance(obj[field], bool), f"{path}.{field} must be bool")
+
+
+def main():
+    if len(sys.argv) != 2:
+        fail("usage: check-mt-schedule-json.py <schedule.json>")
+
+    path = Path(sys.argv[1])
+    expect(path.is_file(), f"{path} does not exist")
+
+    try:
+        data = json.loads(path.read_text())
+    except json.JSONDecodeError as exc:
+        fail(f"{path} is not valid JSON: {exc}")
+
+    expect(data.get("format") == "gsim.mt-schedule.v1", "unexpected or missing format")
+    tasks = data.get("tasks")
+    expect(isinstance(tasks, list), "tasks must be a list")
+    expect(tasks, "tasks must not be empty")
+
+    seen_cpp_ids = set()
+    edge_refs = []
+    saw_state_update = False
+    saw_reset = False
+    saw_clock = False
+    for scan_index, task in enumerate(tasks):
+        path_prefix = f"tasks[{scan_index}]"
+        expect(isinstance(task, dict), f"{path_prefix} must be an object")
+
+        for field in (
+            "cpp_id",
+            "scan_index",
+            "super_id",
+            "super_type",
+            "active_word",
+            "active_mask",
+            "node_kinds",
+            "pred_cpp_ids",
+            "succ_cpp_ids",
+            "active_fanout",
+            "boundary",
+            "repcut",
+        ):
+            expect(field in task, f"missing {path_prefix}.{field}")
+
+        cpp_id = task["cpp_id"]
+        expect(isinstance(cpp_id, int) and cpp_id >= 0, f"{path_prefix}.cpp_id must be non-negative int")
+        expect(cpp_id not in seen_cpp_ids, f"duplicate cpp_id {cpp_id}")
+        seen_cpp_ids.add(cpp_id)
+        expect(task["scan_index"] == scan_index, f"{path_prefix}.scan_index must match array order")
+        expect(task["cpp_id"] == scan_index, f"{path_prefix}.cpp_id must match scan order for milestone 01")
+        expect(isinstance(task["super_id"], int) and task["super_id"] > 0, f"{path_prefix}.super_id must be positive int")
+        expect(isinstance(task["super_type"], str) and task["super_type"], f"{path_prefix}.super_type must be string")
+        expect(isinstance(task["active_word"], int) and task["active_word"] >= 0, f"{path_prefix}.active_word must be non-negative int")
+        expect(isinstance(task["active_mask"], str) and task["active_mask"].startswith("0x"), f"{path_prefix}.active_mask must be hex string")
+        int(task["active_mask"], 16)
+
+        node_kinds = task["node_kinds"]
+        expect(isinstance(node_kinds, dict), f"{path_prefix}.node_kinds must be object")
+        expect(node_kinds, f"{path_prefix}.node_kinds must not be empty")
+        for name, count in node_kinds.items():
+            expect(isinstance(name, str) and name.startswith("NODE_"), f"{path_prefix}.node_kinds key must be node kind")
+            expect(isinstance(count, int) and count > 0, f"{path_prefix}.node_kinds[{name}] must be positive int")
+
+        for field in ("pred_cpp_ids", "succ_cpp_ids", "active_fanout"):
+            values = task[field]
+            expect(isinstance(values, list), f"{path_prefix}.{field} must be list")
+            edge_refs.append((path_prefix, field, values))
+            last = -1
+            for value in values:
+                expect(isinstance(value, int) and value >= 0, f"{path_prefix}.{field} values must be non-negative int")
+                expect(value > last, f"{path_prefix}.{field} must be sorted and unique")
+                last = value
+
+        boundary = task["boundary"]
+        expect(isinstance(boundary, dict), f"{path_prefix}.boundary must be object")
+        expect(REQUIRED_BOUNDARY_FIELDS.issubset(boundary), f"{path_prefix}.boundary missing required fields")
+        for field in REQUIRED_BOUNDARY_FIELDS - {"clock_names"}:
+            expect_bool(boundary, field, f"{path_prefix}.boundary")
+        expect(isinstance(boundary["clock_names"], list), f"{path_prefix}.boundary.clock_names must be list")
+        for clock_name in boundary["clock_names"]:
+            expect(isinstance(clock_name, str), f"{path_prefix}.boundary.clock_names values must be strings")
+        saw_state_update = saw_state_update or boundary["has_state_update"]
+        saw_reset = saw_reset or boundary["has_reset"]
+        saw_clock = saw_clock or bool(boundary["clock_names"])
+
+        repcut = task["repcut"]
+        expect(isinstance(repcut, dict), f"{path_prefix}.repcut must be object")
+        expect(REQUIRED_REPCUT_FIELDS.issubset(repcut), f"{path_prefix}.repcut missing required fields")
+        expect_bool(repcut, "is_source", f"{path_prefix}.repcut")
+        expect_bool(repcut, "is_sink", f"{path_prefix}.repcut")
+        expect(repcut["candidate_cost"] is None,
+               f"{path_prefix}.repcut.candidate_cost must be null before classifier")
+
+    for path_prefix, field, values in edge_refs:
+        for value in values:
+            expect(value in seen_cpp_ids, f"{path_prefix}.{field} references missing cpp_id {value}")
+
+    if path.name == "repro-usefulreset_mt_schedule.json":
+        expect(saw_state_update, "repro-usefulreset schedule must expose state-update boundary evidence")
+        expect(saw_reset, "repro-usefulreset schedule must expose reset boundary evidence")
+        expect(saw_clock, "repro-usefulreset schedule must expose clock boundary evidence")
+
+    print(f"checked {len(tasks)} mt schedule tasks in {path}")
+
+
+if __name__ == "__main__":
+    main()
