@@ -8,7 +8,9 @@
 #include <cstddef>
 #include <cstdio>
 #include <cinttypes>
+#include <cctype>
 #include <algorithm>
+#include <cstdlib>
 #include <map>
 #include <set>
 #include <stack>
@@ -51,6 +53,13 @@ static bool isAlwaysActive(int cppId) {
   return alwaysActive.find(cppId) != alwaysActive.end();
 }
 
+static bool hasCppId(const std::set<SuperNode*>& supers, int cppId) {
+  for (SuperNode* super : supers) {
+    if (super && super->cppId == cppId) return true;
+  }
+  return false;
+}
+
 struct MtBoundaryInfo {
   std::map<std::string, int> nodeKinds;
   std::set<std::string> clockNames;
@@ -75,6 +84,57 @@ struct MtTaskInfo {
   bool isSink = false;
   int candidateCost = 0;
   bool hasCandidateCost = false;
+  std::string repcutRole = "none";
+  int repcutSourceCount = 0;
+  int repcutSinkCount = 0;
+  int repcutFanout = 0;
+  int repcutCopyCost = 0;
+  std::string repcutBlockReason;
+  bool repcutSelected = false;
+  bool repcutRuntimeApplied = false;
+  int repcutCutInEdges = 0;
+  int repcutCutOutEdges = 0;
+};
+
+struct MtRepCutEdge {
+  int fromCppId = -1;
+  int toCppId = -1;
+  std::string reason;
+};
+
+struct MtPureBatchPlan {
+  std::vector<std::pair<int, int>> batches;
+  std::vector<MtRepCutEdge> cutEdges;
+  int segmentCount = 0;
+};
+
+struct MtRepCutClone {
+  int sourceCppId = -1;
+  int sinkCppId = -1;
+  Node* sourceNode = nullptr;
+  std::string cloneName;
+  std::string expr;
+  std::string fallbackReason;
+};
+
+struct MtRepCutBatch {
+  int beginCppId = -1;
+  int endCppId = -1;
+  int cutEdgeCount = 0;
+  int cloneCount = 0;
+  uint64_t forcedSinkMask = 0;
+  std::set<int> forcedSinkCppIds;
+  bool forcedSerial = true;
+  bool parallelSafe = false;
+  bool forcedSinkActivation = false;
+  std::string parallelSafeReason;
+  std::string fallbackReason;
+};
+
+struct MtRepCutSemanticPlan {
+  MtPureBatchPlan batchPlan;
+  std::vector<MtRepCutClone> clones;
+  std::vector<MtRepCutBatch> cutBatches;
 };
 
 static const char* nodeTypeName(NodeType type) {
@@ -429,12 +489,597 @@ static std::map<int, MtTaskInfo> buildMtTaskInfoMap() {
   return tasks;
 }
 
+static bool mtTasksHaveEdge(SuperNode* lhs, SuperNode* rhs) {
+  int lhsId = lhs->cppId;
+  int rhsId = rhs->cppId;
+  if (hasCppId(lhs->prev, rhsId) || hasCppId(lhs->next, rhsId) ||
+      hasCppId(lhs->depPrev, rhsId) || hasCppId(lhs->depNext, rhsId) ||
+      hasCppId(rhs->prev, lhsId) || hasCppId(rhs->next, lhsId) ||
+      hasCppId(rhs->depPrev, lhsId) || hasCppId(rhs->depNext, lhsId)) {
+    return true;
+  }
+  for (Node* member : lhs->member) {
+    if (member->nextActiveId.find(rhsId) != member->nextActiveId.end()) return true;
+  }
+  for (Node* member : rhs->member) {
+    if (member->nextActiveId.find(lhsId) != member->nextActiveId.end()) return true;
+  }
+  return false;
+}
+
+static bool mtTasksHaveDirectedEdge(SuperNode* from, SuperNode* to) {
+  int toId = to->cppId;
+  int fromId = from->cppId;
+  if (hasCppId(from->next, toId) || hasCppId(from->depNext, toId) ||
+      hasCppId(to->prev, fromId) || hasCppId(to->depPrev, fromId)) {
+    return true;
+  }
+  for (Node* member : from->member) {
+    if (member->nextActiveId.find(toId) != member->nextActiveId.end()) return true;
+  }
+  return false;
+}
+
+static bool mtTaskCanEnterPureBatch(const std::map<int, MtTaskInfo>& tasks, int cppId) {
+  auto iter = tasks.find(cppId);
+  if (iter == tasks.end()) return false;
+  if (iter->second.taskKind != "pure_compute") return false;
+  if (isAlwaysActive(cppId)) return false;
+  return true;
+}
+
+static bool mtCanCutEdge(const std::map<int, MtTaskInfo>& tasks, int fromCppId, int toCppId) {
+  if (fromCppId == toCppId) return false;
+  auto from = tasks.find(fromCppId);
+  auto to = tasks.find(toCppId);
+  if (from == tasks.end() || to == tasks.end()) return false;
+  if (from->second.taskKind != "pure_compute" || to->second.taskKind != "pure_compute") return false;
+  if (!from->second.serialReasons.empty() || !to->second.serialReasons.empty()) return false;
+  if (!to->second.repcutSelected) return false;
+  if (isAlwaysActive(fromCppId) || isAlwaysActive(toCppId)) return false;
+  if (fromCppId / ACTIVE_WIDTH != toCppId / ACTIVE_WIDTH) return false;
+  return mtTasksHaveDirectedEdge(cppId2Super[fromCppId], cppId2Super[toCppId]);
+}
+
+static bool mtTaskCanJoinPureBatchWithCuts(const std::map<int, MtTaskInfo>& tasks,
+                                           const std::vector<int>& batch,
+                                           int cppId,
+                                           bool allowCuts,
+                                           std::vector<MtRepCutEdge>* cutEdges) {
+  if (!mtTaskCanEnterPureBatch(tasks, cppId)) return false;
+  for (int existingCppId : batch) {
+    if (!mtTasksHaveEdge(cppId2Super[existingCppId], cppId2Super[cppId])) continue;
+    bool cutForward = allowCuts && mtCanCutEdge(tasks, existingCppId, cppId);
+    bool cutBackward = allowCuts && mtCanCutEdge(tasks, cppId, existingCppId);
+    if (!cutForward && !cutBackward) return false;
+    if (cutEdges) {
+      if (cutForward) cutEdges->push_back({existingCppId, cppId, "pure_successor_selected"});
+      if (cutBackward) cutEdges->push_back({cppId, existingCppId, "pure_successor_selected"});
+    }
+  }
+  return true;
+}
+
+static MtPureBatchPlan planMtPureBatches(const std::map<int, MtTaskInfo>& tasks, bool allowCuts) {
+  MtPureBatchPlan plan;
+  for (int idx = 0; idx < superId; idx ++) {
+    int id;
+    uint64_t mask;
+    std::tie(id, mask) = setIdxMask(idx);
+    bool activeWhole = true;
+    for (int j = 0; j < ACTIVE_WIDTH && idx + j < superId; j ++) {
+      if (isAlwaysActive(idx + j)) activeWhole = false;
+    }
+    if (!activeWhole || !mtTaskCanEnterPureBatch(tasks, idx)) continue;
+    plan.segmentCount ++;
+
+    std::vector<int> batch;
+    std::vector<MtRepCutEdge> batchCutEdges;
+    batch.push_back(idx);
+    int batchEnd = idx + 1;
+    while (batchEnd < superId && batchEnd / ACTIVE_WIDTH == id &&
+           mtTaskCanJoinPureBatchWithCuts(tasks, batch, batchEnd, allowCuts, &batchCutEdges)) {
+      batch.push_back(batchEnd);
+      batchEnd ++;
+    }
+    if (batchEnd - idx > 1) {
+      plan.batches.push_back(std::make_pair(idx, batchEnd));
+      plan.cutEdges.insert(plan.cutEdges.end(), batchCutEdges.begin(), batchCutEdges.end());
+      idx = batchEnd - 1;
+    }
+  }
+  return plan;
+}
+
+static std::string mtRepCutIntLiteral(ENode* enode) {
+  if (!enode->strVal.empty()) {
+    std::string value = enode->strVal;
+    if (!value.empty() && value[0] == '-') return "(" + value + ")";
+    return value;
+  }
+  if (!enode->values.empty()) return "0x" + std::to_string(enode->values[0]);
+  return "";
+}
+
+static bool mtRepCutExprString(ENode* enode,
+                               std::string& expr,
+                               std::string& reason,
+                               const std::map<Node*, std::string>& replacements = {}) {
+  if (!enode) {
+    reason = "unsupported_expr";
+    return false;
+  }
+  if (enode->nodePtr) {
+    auto repl = replacements.find(enode->nodePtr);
+    expr = repl == replacements.end() ? enode->nodePtr->name : repl->second;
+    return true;
+  }
+  if (enode->opType == OP_INT) {
+    expr = mtRepCutIntLiteral(enode);
+    if (expr.empty()) reason = "unsupported_expr";
+    return !expr.empty();
+  }
+
+  auto childExpr = [&](size_t idx, std::string& out) {
+    if (idx >= enode->getChildNum()) {
+      reason = "unsupported_expr";
+      return false;
+    }
+    return mtRepCutExprString(enode->getChild(idx), out, reason, replacements);
+  };
+
+  std::string lhs;
+  std::string rhs;
+  switch (enode->opType) {
+    case OP_ADD:
+      if (!childExpr(0, lhs) || !childExpr(1, rhs)) return false;
+      expr = "(" + lhs + " + " + rhs + ")";
+      if (enode->width > 0) expr = "(" + expr + " & " + bitMask(enode->width) + ")";
+      return true;
+    case OP_AND:
+      if (!childExpr(0, lhs) || !childExpr(1, rhs)) return false;
+      expr = "(" + lhs + " & " + rhs + ")";
+      return true;
+    case OP_OR:
+      if (!childExpr(0, lhs) || !childExpr(1, rhs)) return false;
+      expr = "(" + lhs + " | " + rhs + ")";
+      return true;
+    case OP_XOR:
+      if (!childExpr(0, lhs) || !childExpr(1, rhs)) return false;
+      expr = "(" + lhs + " ^ " + rhs + ")";
+      return true;
+    case OP_TAIL:
+      if (!childExpr(0, lhs)) return false;
+      if (enode->values.empty()) {
+        reason = "unsupported_expr";
+        return false;
+      }
+      expr = "(" + lhs + " & " + bitMask(MIN(enode->width, enode->values[0])) + ")";
+      return true;
+    case OP_BITS:
+    case OP_BITS_NOSHIFT:
+      if (!childExpr(0, lhs)) return false;
+      if (enode->values.size() < 2) {
+        reason = "unsupported_expr";
+        return false;
+      }
+      expr = "((" + lhs + " >> " + std::to_string(enode->values[1]) + ") & " + bitMask(enode->width) + ")";
+      return true;
+    case OP_PAD:
+    case OP_ASUINT:
+      if (!childExpr(0, lhs)) return false;
+      expr = lhs;
+      return true;
+    case OP_MUX: {
+      std::string cond;
+      std::string tval;
+      std::string fval;
+      if (!childExpr(0, cond) || !childExpr(1, tval) || !childExpr(2, fval)) return false;
+      if (enode->width == 1) expr = "((" + cond + " & " + tval + ") | ((!" + cond + ") & " + fval + "))";
+      else expr = format("((-(%s)%s & %s) | ((-(%s)!%s) & %s))",
+                         widthUType(enode->width).c_str(), cond.c_str(), tval.c_str(),
+                         widthUType(enode->width).c_str(), cond.c_str(), fval.c_str());
+      return true;
+    }
+    default:
+      reason = "unsupported_expr";
+      return false;
+  }
+}
+
+static Node* mtRepCutSingleProducedNode(int cppId, std::string& reason) {
+  auto superIter = cppId2Super.find(cppId);
+  if (superIter == cppId2Super.end()) {
+    reason = "missing_clone";
+    return nullptr;
+  }
+  std::vector<Node*> candidates;
+  for (Node* member : superIter->second->member) {
+    if (!member || member->isLocal() || member->isArray()) continue;
+    if (member->type != NODE_OTHERS) continue;
+    if (member->assignTree.size() != 1) continue;
+    candidates.push_back(member);
+  }
+  if (candidates.size() != 1) {
+    reason = "missing_clone";
+    return nullptr;
+  }
+  return candidates[0];
+}
+
+static bool mtRepCutNodeOnlyFeedsSink(Node* node, int sinkCppId) {
+  if (!node) return false;
+  bool hasSink = false;
+  for (Node* next : node->next) {
+    if (!next || !next->super || next->super->cppId < 0) continue;
+    if (next->super->cppId != sinkCppId) return false;
+    hasSink = true;
+  }
+  for (Node* next : node->depNext) {
+    if (!next || !next->super || next->super->cppId < 0) continue;
+    if (next->super->cppId != sinkCppId) return false;
+    hasSink = true;
+  }
+  return hasSink;
+}
+
+static std::map<Node*, std::string> mtRepCutReplacementMap(const std::vector<MtRepCutClone>& clones) {
+  std::map<Node*, std::string> replacements;
+  for (const MtRepCutClone& clone : clones) {
+    if (clone.sourceNode && clone.fallbackReason.empty()) replacements[clone.sourceNode] = clone.cloneName;
+  }
+  return replacements;
+}
+
+static MtRepCutClone mtPlanRepCutCloneForEdge(const MtRepCutEdge& edge) {
+  MtRepCutClone clone;
+  clone.sourceCppId = edge.fromCppId;
+  clone.sinkCppId = edge.toCppId;
+  std::string reason;
+  Node* sourceNode = mtRepCutSingleProducedNode(edge.fromCppId, reason);
+  if (!sourceNode) {
+    clone.fallbackReason = reason.empty() ? "missing_clone" : reason;
+    return clone;
+  }
+  if (!mtRepCutNodeOnlyFeedsSink(sourceNode, edge.toCppId)) {
+    clone.sourceNode = sourceNode;
+    clone.fallbackReason = "multi_consumer_not_supported";
+    return clone;
+  }
+  if (sourceNode->assignTree.size() != 1) {
+    clone.sourceNode = sourceNode;
+    clone.fallbackReason = "missing_clone";
+    return clone;
+  }
+  std::string expr;
+  if (!mtRepCutExprString(sourceNode->assignTree[0]->getRoot(), expr, reason)) {
+    clone.sourceNode = sourceNode;
+    clone.fallbackReason = reason.empty() ? "unsupported_expr" : reason;
+    return clone;
+  }
+  clone.sourceNode = sourceNode;
+  clone.cloneName = format("repcut_%d_%d_%s", edge.fromCppId, edge.toCppId, sourceNode->name.c_str());
+  clone.expr = expr;
+  return clone;
+}
+
+static bool mtRepCutEdgeInBatch(const MtRepCutEdge& edge, const std::pair<int, int>& batch) {
+  return batch.first <= edge.fromCppId && edge.fromCppId < batch.second &&
+         batch.first <= edge.toCppId && edge.toCppId < batch.second;
+}
+
+static bool mtRepCutHasClonedEdge(const std::set<std::pair<int, int>>& clonedEdges,
+                                  int fromCppId,
+                                  int toCppId) {
+  return clonedEdges.find(std::make_pair(fromCppId, toCppId)) != clonedEdges.end();
+}
+
+static MtRepCutSemanticPlan planMtRepCutSemantics(const std::map<int, MtTaskInfo>& tasks) {
+  MtRepCutSemanticPlan semanticPlan;
+  semanticPlan.batchPlan = planMtPureBatches(tasks, globalConfig.MtRepCutLiteMode == "on");
+
+  for (auto batch : semanticPlan.batchPlan.batches) {
+    MtRepCutBatch cutBatch;
+    cutBatch.beginCppId = batch.first;
+    cutBatch.endCppId = batch.second;
+    std::vector<MtRepCutClone> batchClones;
+    std::set<std::pair<int, int>> clonedEdges;
+    for (const MtRepCutEdge& edge : semanticPlan.batchPlan.cutEdges) {
+      if (!mtRepCutEdgeInBatch(edge, batch)) continue;
+      cutBatch.cutEdgeCount ++;
+      cutBatch.forcedSinkCppIds.insert(edge.toCppId);
+      MtRepCutClone clone = mtPlanRepCutCloneForEdge(edge);
+      if (!clone.fallbackReason.empty() && cutBatch.fallbackReason.empty()) {
+        cutBatch.fallbackReason = clone.fallbackReason;
+      } else if (clone.fallbackReason.empty()) {
+        cutBatch.cloneCount ++;
+        clonedEdges.insert(std::make_pair(clone.sourceCppId, clone.sinkCppId));
+      }
+      batchClones.push_back(clone);
+    }
+    if (cutBatch.cutEdgeCount == 0) continue;
+    bool forcedSinkInputsCloned = cutBatch.fallbackReason.empty() &&
+                                  cutBatch.cloneCount == cutBatch.cutEdgeCount &&
+                                  !cutBatch.forcedSinkCppIds.empty();
+    for (int sinkCppId : cutBatch.forcedSinkCppIds) {
+      auto sink = tasks.find(sinkCppId);
+      if (sink == tasks.end() || sink->second.taskKind != "pure_compute" ||
+          !sink->second.repcutSelected || !sink->second.serialReasons.empty()) {
+        forcedSinkInputsCloned = false;
+        if (cutBatch.fallbackReason.empty()) cutBatch.fallbackReason = "unsafe_forced_sink";
+        break;
+      }
+      for (int sourceCppId = batch.first; sourceCppId < batch.second; sourceCppId ++) {
+        if (sourceCppId == sinkCppId) continue;
+        if (!mtTasksHaveDirectedEdge(cppId2Super[sourceCppId], cppId2Super[sinkCppId])) continue;
+        if (!mtRepCutHasClonedEdge(clonedEdges, sourceCppId, sinkCppId)) {
+          forcedSinkInputsCloned = false;
+          if (cutBatch.fallbackReason.empty()) cutBatch.fallbackReason = "forced_sink_input_without_clone";
+          break;
+        }
+      }
+      if (!forcedSinkInputsCloned) break;
+      cutBatch.forcedSinkMask |= (uint64_t)1 << (sinkCppId % ACTIVE_WIDTH);
+    }
+    cutBatch.parallelSafe = forcedSinkInputsCloned && cutBatch.forcedSinkMask != 0;
+    cutBatch.forcedSerial = !cutBatch.parallelSafe;
+    if (cutBatch.forcedSerial && cutBatch.fallbackReason.empty()) cutBatch.fallbackReason = "missing_clone";
+    if (cutBatch.parallelSafe) {
+      cutBatch.forcedSinkActivation = true;
+      cutBatch.parallelSafeReason = "all_forced_sink_cut_inputs_cloned";
+    }
+    semanticPlan.cutBatches.push_back(cutBatch);
+    semanticPlan.clones.insert(semanticPlan.clones.end(), batchClones.begin(), batchClones.end());
+  }
+
+  return semanticPlan;
+}
+
+static std::vector<MtRepCutClone> mtRepCutClonesForSink(const MtRepCutSemanticPlan& semanticPlan, int sinkCppId) {
+  std::vector<MtRepCutClone> clones;
+  for (const MtRepCutClone& clone : semanticPlan.clones) {
+    if (clone.sinkCppId == sinkCppId && clone.fallbackReason.empty()) clones.push_back(clone);
+  }
+  return clones;
+}
+
+static bool mtRepCutNameChar(char ch) {
+  return std::isalnum(static_cast<unsigned char>(ch)) || ch == '_' || ch == '$';
+}
+
+static std::string mtRepCutReplaceNodeNames(const std::string& text, const std::map<Node*, std::string>& replacements) {
+  std::string result = text;
+  for (const auto& repl : replacements) {
+    const std::string& from = repl.first->name;
+    const std::string& to = repl.second;
+    std::string replaced;
+    size_t pos = 0;
+    while (pos < result.size()) {
+      size_t hit = result.find(from, pos);
+      if (hit == std::string::npos) {
+        replaced.append(result.substr(pos));
+        break;
+      }
+      bool leftOk = hit == 0 || !mtRepCutNameChar(result[hit - 1]);
+      bool rightOk = hit + from.size() >= result.size() || !mtRepCutNameChar(result[hit + from.size()]);
+      replaced.append(result.substr(pos, hit - pos));
+      if (leftOk && rightOk) {
+        replaced.append(to);
+      } else {
+        replaced.append(from);
+      }
+      pos = hit + from.size();
+    }
+    result.swap(replaced);
+  }
+  return result;
+}
+
+static uint64_t mtRepCutForcedSinkMaskForBatch(const MtRepCutSemanticPlan& semanticPlan, int beginCppId) {
+  for (const MtRepCutBatch& batch : semanticPlan.cutBatches) {
+    if (batch.beginCppId == beginCppId && batch.parallelSafe) return batch.forcedSinkMask;
+  }
+  return 0;
+}
+
+static void collectMtTaskRepCutCounts(std::map<int, MtTaskInfo>& tasks) {
+  for (auto& iter : tasks) {
+    MtTaskInfo& task = iter.second;
+    task.repcutRole = "none";
+    task.repcutSourceCount = 0;
+    task.repcutSinkCount = 0;
+    task.repcutFanout = 0;
+    task.repcutCopyCost = task.hasCandidateCost ? task.candidateCost : 0;
+    task.repcutBlockReason.clear();
+    task.repcutSelected = false;
+  }
+
+  for (auto& iter : tasks) {
+    int cppId = iter.first;
+    MtTaskInfo& task = iter.second;
+    SuperNode* super = cppId2Super[cppId];
+    std::set<int> predCppIds;
+    std::set<int> succCppIds;
+    std::set<int> activeFanout;
+
+    addCppIdsIfExecutable(predCppIds, super->prev);
+    addCppIdsIfExecutable(predCppIds, super->depPrev);
+    addCppIdsIfExecutable(succCppIds, super->next);
+    addCppIdsIfExecutable(succCppIds, super->depNext);
+    for (Node* member : super->member) {
+      for (int activeId : member->nextNeedActivate) {
+        if (activeId >= 0) activeFanout.insert(activeId);
+      }
+    }
+
+    int sourceCount = 0;
+    for (int predId : predCppIds) {
+      auto pred = tasks.find(predId);
+      if (pred != tasks.end() && pred->second.taskKind == "serial") sourceCount ++;
+    }
+    int sinkCount = 0;
+    std::set<int> sinks = succCppIds;
+    sinks.insert(activeFanout.begin(), activeFanout.end());
+    for (int succId : sinks) {
+      auto succ = tasks.find(succId);
+      if (succ != tasks.end() && succ->second.taskKind == "serial") sinkCount ++;
+    }
+
+    if (task.taskKind == "pure_compute") {
+      if (sourceCount == 0 && task.isSource) sourceCount = 1;
+      if (sinkCount == 0 && task.isSink) sinkCount = 1;
+      task.repcutSourceCount = sourceCount;
+      task.repcutSinkCount = sinkCount;
+      task.repcutFanout = static_cast<int>(sinks.size());
+      if (sourceCount > 0 && sinkCount > 0) task.repcutRole = "candidate";
+      else if (sourceCount > 0) task.repcutRole = "source";
+      else if (sinkCount > 0) task.repcutRole = "sink";
+    } else {
+      task.repcutFanout = static_cast<int>(sinks.size());
+      if (!task.serialReasons.empty()) task.repcutBlockReason = task.serialReasons.front();
+      else task.repcutBlockReason = "serial_without_reason";
+    }
+  }
+}
+
+static std::map<int, MtTaskInfo> buildMtTaskInfoMapWithRepCut() {
+  std::map<int, MtTaskInfo> tasks = buildMtTaskInfoMap();
+  collectMtTaskRepCutCounts(tasks);
+  return tasks;
+}
+
+static std::string repcutBlockReasonForTask(const MtTaskInfo& task) {
+  if (task.taskKind != "pure_compute") {
+    if (!task.serialReasons.empty()) return task.serialReasons.front();
+    return task.repcutBlockReason.empty() ? "serial_without_reason" : task.repcutBlockReason;
+  }
+  if (!task.hasCandidateCost) return "missing_candidate_cost";
+  if (task.repcutRole != "candidate") return "not_boundary_candidate";
+  if (task.repcutSourceCount <= 0) return "missing_source_evidence";
+  if (task.repcutSinkCount <= 0) return "missing_sink_evidence";
+  if (task.repcutCopyCost <= 0) return "missing_copy_cost";
+  return "";
+}
+
+static void applyRepCutLiteSelection(std::map<int, MtTaskInfo>& tasks) {
+  int remainingBudget = globalConfig.MtRepCutCopyBudget;
+  bool enabled = globalConfig.MtRepCutLiteMode == "on";
+  for (auto& iter : tasks) {
+    MtTaskInfo& task = iter.second;
+    task.repcutSelected = false;
+    task.repcutRuntimeApplied = false;
+    task.repcutCutInEdges = 0;
+    task.repcutCutOutEdges = 0;
+    task.repcutBlockReason = repcutBlockReasonForTask(task);
+
+    if (!enabled) {
+      if (task.repcutBlockReason.empty()) task.repcutBlockReason = "disabled";
+      continue;
+    }
+    if (globalConfig.MtRepCutCopyBudget <= 0) {
+      if (task.repcutBlockReason.empty()) task.repcutBlockReason = "copy_budget_zero";
+      continue;
+    }
+    if (globalConfig.MtRepCutFanoutBudget <= 0) {
+      if (task.repcutBlockReason.empty()) task.repcutBlockReason = "fanout_budget_zero";
+      continue;
+    }
+    if (!task.repcutBlockReason.empty()) continue;
+    if (task.repcutFanout > globalConfig.MtRepCutFanoutBudget) {
+      task.repcutBlockReason = "fanout_budget_exceeded";
+      continue;
+    }
+    if (task.repcutCopyCost > remainingBudget) {
+      task.repcutBlockReason = "copy_budget_exceeded";
+      continue;
+    }
+    task.repcutSelected = true;
+    remainingBudget -= task.repcutCopyCost;
+  }
+
+  for (auto& iter : tasks) {
+    int cppId = iter.first;
+    MtTaskInfo& task = iter.second;
+    if (!enabled || task.repcutSelected || task.taskKind != "pure_compute") continue;
+    if (task.hasCandidateCost && task.repcutCopyCost > 0) {
+      std::set<int> predCppIds;
+      addCppIdsIfExecutable(predCppIds, cppId2Super[cppId]->prev);
+      addCppIdsIfExecutable(predCppIds, cppId2Super[cppId]->depPrev);
+      bool hasPurePred = false;
+      for (int predId : predCppIds) {
+        auto pred = tasks.find(predId);
+        if (pred != tasks.end() && pred->second.taskKind == "pure_compute") hasPurePred = true;
+      }
+      if (!hasPurePred) continue;
+      if (globalConfig.MtRepCutCopyBudget <= 0) {
+        task.repcutBlockReason = "copy_budget_zero";
+        continue;
+      }
+      if (globalConfig.MtRepCutFanoutBudget <= 0) {
+        task.repcutBlockReason = "fanout_budget_zero";
+        continue;
+      }
+      if (task.repcutFanout > globalConfig.MtRepCutFanoutBudget) {
+        task.repcutBlockReason = "fanout_budget_exceeded";
+        continue;
+      }
+      if (task.repcutCopyCost > remainingBudget) {
+        task.repcutBlockReason = "copy_budget_exceeded";
+        continue;
+      }
+      task.repcutSelected = true;
+      task.repcutBlockReason.clear();
+      remainingBudget -= task.repcutCopyCost;
+    }
+  }
+}
+
+static std::map<int, MtTaskInfo> buildMtTaskInfoMapWithRepCutSelection() {
+  std::map<int, MtTaskInfo> tasks = buildMtTaskInfoMapWithRepCut();
+  applyRepCutLiteSelection(tasks);
+  return tasks;
+}
+
+static bool mtTaskUsesRepCutLiteRuntime(const std::map<int, MtTaskInfo>& tasks, int cppId) {
+  auto iter = tasks.find(cppId);
+  if (iter == tasks.end()) return false;
+  return globalConfig.MtHelperMode == "mt" && iter->second.repcutSelected &&
+         iter->second.taskKind == "pure_compute";
+}
+
+static bool markMtRepCutLiteRuntimeApplied(std::map<int, MtTaskInfo>& tasks) {
+  if (globalConfig.MtHelperMode != "mt") return false;
+  bool anyApplied = false;
+  for (auto& iter : tasks) {
+    iter.second.repcutRuntimeApplied = false;
+    iter.second.repcutCutInEdges = 0;
+    iter.second.repcutCutOutEdges = 0;
+  }
+
+  MtPureBatchPlan plan = planMtPureBatches(tasks, globalConfig.MtRepCutLiteMode == "on");
+  for (auto batch : plan.batches) {
+    for (int cppId = batch.first; cppId < batch.second; cppId ++) {
+      auto task = tasks.find(cppId);
+      if (task != tasks.end() && mtTaskUsesRepCutLiteRuntime(tasks, cppId)) {
+        task->second.repcutRuntimeApplied = true;
+        anyApplied = true;
+      }
+    }
+  }
+  for (const MtRepCutEdge& edge : plan.cutEdges) {
+    tasks[edge.fromCppId].repcutCutOutEdges ++;
+    tasks[edge.toCppId].repcutCutInEdges ++;
+  }
+
+  return anyApplied;
+}
+
 void graph::dumpMtScheduleJson() {
   std::string baseName = globalConfig.InputBaseName.empty() ? name : globalConfig.InputBaseName;
   std::string path = globalConfig.OutputDir + "/" + baseName + "_mt_schedule.json";
   FILE* fp = std::fopen(path.c_str(), "w");
   Assert(fp != nullptr, "failed to open mt schedule json %s", path.c_str());
-  std::map<int, MtTaskInfo> mtTasks = buildMtTaskInfoMap();
+  std::map<int, MtTaskInfo> mtTasks = buildMtTaskInfoMapWithRepCut();
 
   fprintf(fp, "{\n");
   fprintf(fp, "  \"format\": \"gsim.mt-schedule.v1\",\n");
@@ -507,9 +1152,20 @@ void graph::dumpMtScheduleJson() {
     fprintf(fp, "        \"is_source\": %s,\n", mtTask.isSource ? "true" : "false");
     fprintf(fp, "        \"is_sink\": %s,\n", mtTask.isSink ? "true" : "false");
     if (mtTask.hasCandidateCost) {
-      fprintf(fp, "        \"candidate_cost\": %d\n", mtTask.candidateCost);
+      fprintf(fp, "        \"candidate_cost\": %d,\n", mtTask.candidateCost);
     } else {
-      fprintf(fp, "        \"candidate_cost\": null\n");
+      fprintf(fp, "        \"candidate_cost\": null,\n");
+    }
+    fprintf(fp, "        \"repcut_role\": \"%s\",\n", mtTask.repcutRole.c_str());
+    fprintf(fp, "        \"repcut_source_count\": %d,\n", mtTask.repcutSourceCount);
+    fprintf(fp, "        \"repcut_sink_count\": %d,\n", mtTask.repcutSinkCount);
+    fprintf(fp, "        \"repcut_copy_cost\": %d,\n", mtTask.repcutCopyCost);
+    fprintf(fp, "        \"repcut_fanout\": %d,\n", mtTask.repcutFanout);
+    std::string blockReason = repcutBlockReasonForTask(mtTask);
+    if (blockReason.empty()) {
+      fprintf(fp, "        \"repcut_block_reason\": null\n");
+    } else {
+      fprintf(fp, "        \"repcut_block_reason\": \"%s\"\n", jsonEscape(blockReason).c_str());
     }
     fprintf(fp, "      }\n");
     fprintf(fp, "    }%s\n", cppId + 1 == superId ? "" : ",");
@@ -519,6 +1175,138 @@ void graph::dumpMtScheduleJson() {
   fprintf(fp, "}\n");
   fclose(fp);
   printf("[mt-schedule] wrote %d tasks to %s\n", superId, path.c_str());
+}
+
+void graph::dumpMtRepCutLiteReport() {
+  std::string baseName = globalConfig.InputBaseName.empty() ? name : globalConfig.InputBaseName;
+  std::string path = globalConfig.OutputDir + "/" + baseName + "_mt_repcut_lite.json";
+  FILE* fp = std::fopen(path.c_str(), "w");
+  Assert(fp != nullptr, "failed to open mt repcut-lite report %s", path.c_str());
+  std::map<int, MtTaskInfo> mtTasks = buildMtTaskInfoMapWithRepCutSelection();
+  bool appliedToRuntime = markMtRepCutLiteRuntimeApplied(mtTasks);
+  MtPureBatchPlan uncutPlan = planMtPureBatches(mtTasks, false);
+  MtPureBatchPlan cutPlan = planMtPureBatches(mtTasks, globalConfig.MtRepCutLiteMode == "on");
+  MtRepCutSemanticPlan semanticPlan = planMtRepCutSemantics(mtTasks);
+
+  int selectedCount = 0;
+  int selectedBoundaryCandidateCount = 0;
+  int selectedSinkCount = 0;
+  int selectedCost = 0;
+  int boundaryCandidateCount = 0;
+  int pureCount = 0;
+  for (auto& iter : mtTasks) {
+    const MtTaskInfo& task = iter.second;
+    if (task.taskKind == "pure_compute") pureCount ++;
+    if (task.repcutRole == "candidate") boundaryCandidateCount ++;
+    if (task.repcutSelected) {
+      selectedCount ++;
+      selectedCost += task.repcutCopyCost;
+      if (task.repcutRole == "candidate") selectedBoundaryCandidateCount ++;
+      if (task.repcutRole == "sink") selectedSinkCount ++;
+    }
+  }
+
+  fprintf(fp, "{\n");
+  fprintf(fp, "  \"format\": \"gsim.mt-repcut-lite.v1\",\n");
+  fprintf(fp, "  \"mode\": \"%s\",\n", globalConfig.MtRepCutLiteMode.c_str());
+  fprintf(fp, "  \"copy_budget\": %d,\n", globalConfig.MtRepCutCopyBudget);
+  fprintf(fp, "  \"fanout_budget\": %d,\n", globalConfig.MtRepCutFanoutBudget);
+  fprintf(fp, "  \"task_count\": %d,\n", superId);
+  fprintf(fp, "  \"pure_task_count\": %d,\n", pureCount);
+  fprintf(fp, "  \"boundary_candidate_count\": %d,\n", boundaryCandidateCount);
+  fprintf(fp, "  \"candidate_count\": %d,\n", boundaryCandidateCount);
+  fprintf(fp, "  \"selected_count\": %d,\n", selectedCount);
+  fprintf(fp, "  \"selected_sink_count\": %d,\n", selectedSinkCount);
+  fprintf(fp, "  \"selected_boundary_candidate_count\": %d,\n", selectedBoundaryCandidateCount);
+  fprintf(fp, "  \"selected_copy_cost\": %d,\n", selectedCost);
+  fprintf(fp, "  \"ordering\": \"cpp_id\",\n");
+  fprintf(fp, "  \"applied_to_runtime\": %s,\n", appliedToRuntime ? "true" : "false");
+  fprintf(fp, "  \"uncut_batch_count\": %d,\n", uncutPlan.segmentCount);
+  fprintf(fp, "  \"cut_batch_count\": %d,\n", cutPlan.segmentCount);
+  fprintf(fp, "  \"cut_edge_count\": %zu,\n", cutPlan.cutEdges.size());
+  fprintf(fp, "  \"cut_edges\": [\n");
+  for (size_t i = 0; i < cutPlan.cutEdges.size(); i ++) {
+    const MtRepCutEdge& edge = cutPlan.cutEdges[i];
+    fprintf(fp, "    {\n");
+    fprintf(fp, "      \"from_cpp_id\": %d,\n", edge.fromCppId);
+    fprintf(fp, "      \"to_cpp_id\": %d,\n", edge.toCppId);
+    fprintf(fp, "      \"reason\": \"%s\"\n", jsonEscape(edge.reason).c_str());
+    fprintf(fp, "    }%s\n", i + 1 == cutPlan.cutEdges.size() ? "" : ",");
+  }
+  fprintf(fp, "  ],\n");
+  fprintf(fp, "  \"cut_batches\": [\n");
+  for (size_t i = 0; i < semanticPlan.cutBatches.size(); i ++) {
+    const MtRepCutBatch& batch = semanticPlan.cutBatches[i];
+    fprintf(fp, "    {\n");
+    fprintf(fp, "      \"begin_cpp_id\": %d,\n", batch.beginCppId);
+    fprintf(fp, "      \"end_cpp_id\": %d,\n", batch.endCppId);
+    fprintf(fp, "      \"cut_edge_count\": %d,\n", batch.cutEdgeCount);
+    fprintf(fp, "      \"clone_count\": %d,\n", batch.cloneCount);
+    fprintf(fp, "      \"forced_sink_cpp_ids\": ");
+    dumpJsonIntArray(fp, batch.forcedSinkCppIds);
+    fprintf(fp, ",\n");
+    fprintf(fp, "      \"forced_sink_mask\": \"0x%lx\",\n", batch.forcedSinkMask);
+    fprintf(fp, "      \"forced_sink_activation\": %s,\n", batch.forcedSinkActivation ? "true" : "false");
+    fprintf(fp, "      \"forced_serial\": %s,\n", batch.forcedSerial ? "true" : "false");
+    fprintf(fp, "      \"parallel_safe\": %s,\n", batch.parallelSafe ? "true" : "false");
+    if (!batch.parallelSafeReason.empty()) {
+      fprintf(fp, "      \"parallel_safe_reason\": \"%s\"", jsonEscape(batch.parallelSafeReason).c_str());
+    } else {
+      fprintf(fp, "      \"parallel_safe_reason\": null");
+    }
+    if (!batch.fallbackReason.empty()) {
+      fprintf(fp, ",\n      \"fallback_reason\": \"%s\"\n", jsonEscape(batch.fallbackReason).c_str());
+    } else {
+      fprintf(fp, ",\n      \"fallback_reason\": null\n");
+    }
+    fprintf(fp, "    }%s\n", i + 1 == semanticPlan.cutBatches.size() ? "" : ",");
+  }
+  fprintf(fp, "  ],\n");
+  fprintf(fp, "  \"duplicated_nodes\": [\n");
+  bool firstClone = true;
+  for (const MtRepCutClone& clone : semanticPlan.clones) {
+    if (!clone.fallbackReason.empty()) continue;
+    if (!firstClone) fprintf(fp, ",\n");
+    firstClone = false;
+    fprintf(fp, "    {\n");
+    fprintf(fp, "      \"source_cpp_id\": %d,\n", clone.sourceCppId);
+    fprintf(fp, "      \"sink_cpp_id\": %d,\n", clone.sinkCppId);
+    fprintf(fp, "      \"source_node\": \"%s\",\n", jsonEscape(clone.sourceNode ? clone.sourceNode->name : "").c_str());
+    fprintf(fp, "      \"clone_name\": \"%s\"\n", jsonEscape(clone.cloneName).c_str());
+    fprintf(fp, "    }");
+  }
+  if (!firstClone) fprintf(fp, "\n");
+  fprintf(fp, "  ],\n");
+  fprintf(fp, "  \"tasks\": [\n");
+  for (int cppId = 0; cppId < superId; cppId ++) {
+    const MtTaskInfo& task = mtTasks[cppId];
+    fprintf(fp, "    {\n");
+    fprintf(fp, "      \"cpp_id\": %d,\n", cppId);
+    fprintf(fp, "      \"task_kind\": \"%s\",\n", task.taskKind.c_str());
+    fprintf(fp, "      \"repcut_role\": \"%s\",\n", task.repcutRole.c_str());
+    fprintf(fp, "      \"repcut_source_count\": %d,\n", task.repcutSourceCount);
+    fprintf(fp, "      \"repcut_sink_count\": %d,\n", task.repcutSinkCount);
+    fprintf(fp, "      \"repcut_copy_cost\": %d,\n", task.repcutCopyCost);
+    fprintf(fp, "      \"repcut_fanout\": %d,\n", task.repcutFanout);
+    fprintf(fp, "      \"selected\": %s,\n", task.repcutSelected ? "true" : "false");
+    fprintf(fp, "      \"runtime_applied\": %s,\n", task.repcutRuntimeApplied ? "true" : "false");
+    fprintf(fp, "      \"cut_in_edges\": %d,\n", task.repcutCutInEdges);
+    fprintf(fp, "      \"cut_out_edges\": %d,\n", task.repcutCutOutEdges);
+    if (task.repcutBlockReason.empty()) {
+      fprintf(fp, "      \"block_reason\": null,\n");
+    } else {
+      fprintf(fp, "      \"block_reason\": \"%s\",\n", jsonEscape(task.repcutBlockReason).c_str());
+    }
+    fprintf(fp, "      \"serial_reasons\": ");
+    dumpJsonStringArray(fp, task.serialReasons);
+    fprintf(fp, "\n");
+    fprintf(fp, "    }%s\n", cppId + 1 == superId ? "" : ",");
+  }
+  fprintf(fp, "  ]\n");
+  fprintf(fp, "}\n");
+  fclose(fp);
+  printf("[mt-repcut-lite] wrote %d tasks (%d selected, cost %d) to %s\n",
+         superId, selectedCount, selectedCost, path.c_str());
 }
 
 std::pair<int, int> cppId2flagIdx(int cppId) {
@@ -586,14 +1374,25 @@ ActiveType activeSet2bitMap(std::set<int>& activeId, std::map<uint64_t, ActiveTy
   return std::make_tuple(ret, comment, uniqueIdx);
 }
 
-std::string updateActiveStr(int idx, uint64_t mask) {
+std::string updateActiveStr(int idx, uint64_t mask, const std::string& activeBufferName = "") {
+  if (!activeBufferName.empty()) return format("%s.orWord(%d, 0x%lx);", activeBufferName.c_str(), idx, mask);
   if (mask <= MAX_U8) return format("activeFlags[%d] |= 0x%lx;", idx, mask);
   if (mask <= MAX_U16) return format("*(uint16_t*)&activeFlags[%d] |= 0x%lx;", idx, mask);
   if (mask <= MAX_U32) return format("*(uint32_t*)&activeFlags[%d] |= 0x%lx;", idx, mask);
   return format("*(uint64_t*)&activeFlags[%d] |= 0x%lx;", idx, mask);
 }
 
-std::string updateActiveStr(int idx, uint64_t mask, std::string& cond, int uniqueId) {
+std::string updateActiveStr(int idx, uint64_t mask, std::string& cond, int uniqueId, const std::string& activeBufferName = "") {
+  if (!activeBufferName.empty()) {
+    if (uniqueId >= 0) {
+      return format("%s.orWord(%d, %s%s);", activeBufferName.c_str(), idx, cond.c_str(), shiftBits(uniqueId, ShiftDir::Left).c_str());
+    }
+    int castWidth = 64;
+    if (mask <= MAX_U8) castWidth = 8;
+    else if (mask <= MAX_U16) castWidth = 16;
+    else if (mask <= MAX_U32) castWidth = 32;
+    return format("%s.orWord(%d, -(uint%d_t)%s & 0x%lx);", activeBufferName.c_str(), idx, castWidth, cond.c_str(), mask);
+  }
   auto activeFlags = std::string("activeFlags[") + std::to_string(idx) + std::string("]");
 
   if (mask <= MAX_U8) {
@@ -639,6 +1438,9 @@ FILE* graph::genHeaderStart() {
   includeLib(header, "cstring", true);
   includeLib(header, "map", true);
   includeLib(header, "cstdarg", true);
+  includeLib(header, "thread", true);
+  includeLib(header, "chrono", true);
+  includeLib(header, "cstdlib", true);
   newLine(header);
 
   fprintf(header, "\n// User configuration\n");
@@ -716,6 +1518,28 @@ void graph::genInterfaceOutput(Node* output) {
 void graph::genHeaderEnd(FILE* fp) {
   fprintf(fp, "};\n");
   fprintf(fp, "#endif\n");
+}
+
+static void emitActiveBufferDef(FILE* header, int activeWords) {
+  fprintf(header,
+          "struct ActiveBuffer {\n"
+          "  uint%d_t words[%d];\n"
+          "  void clear() {\n"
+          "    memset(words, 0, sizeof(words));\n"
+          "  }\n"
+          "  void orWord(int idx, uint64_t mask) {\n"
+          "    for (int i = 0; i < 8 && idx + i < %d; i ++) {\n"
+          "      words[idx + i] |= (uint%d_t)(mask >> (i * %d));\n"
+          "    }\n"
+          "  }\n"
+          "  void activateAll() {\n"
+          "    memset(words, 0xff, sizeof(words));\n"
+          "  }\n"
+          "  void mergeFrom(uint%d_t *activeFlags) const {\n"
+          "    for (int i = 0; i < %d; i ++) activeFlags[i] |= words[i];\n"
+          "  }\n"
+          "};\n\n",
+          ACTIVE_WIDTH, activeWords, activeWords, ACTIVE_WIDTH, ACTIVE_WIDTH, ACTIVE_WIDTH, activeWords);
 }
 
 #if defined(DIFFTEST_PER_SIG) && defined(GSIM_DIFF)
@@ -845,7 +1669,8 @@ void graph::genNodeDef(FILE* fp, Node* node) {
   }
 }
 
-void graph::activateNext(Node* node, std::set<int>& nextNodeId, std::string oldName, bool inStep, std::string flagName, int indent) {
+void graph::activateNext(Node* node, std::set<int>& nextNodeId, std::string oldName, bool inStep, std::string flagName,
+                         std::string activeBufferName, int indent) {
   std::string nodeName = node->name;
   auto condName = std::string("cond_") + nodeName;
   bool opt{false};
@@ -871,7 +1696,8 @@ void graph::activateNext(Node* node, std::set<int>& nextNodeId, std::string oldN
   }
   if (node->isAsyncReset()) {
     Assert(!opt, "invalid opt");
-    emitBodyLock(indent, "activateAll();\n");
+    if (activeBufferName.empty()) emitBodyLock(indent, "activateAll();\n");
+    else emitBodyLock(indent, "%s.activateAll();\n", activeBufferName.c_str());
     emitBodyLock(indent, "%s = -1;\n", flagName.c_str());
   } else {
     if (ACTIVE_MASK(curMask) != 0) {
@@ -879,7 +1705,8 @@ void graph::activateNext(Node* node, std::set<int>& nextNodeId, std::string oldN
       else emitBodyLock(indent, "%s |= 0x%lx; // %s\n", flagName.c_str(), ACTIVE_MASK(curMask), ACTIVE_COMMENT(curMask).c_str());
     }
     for (auto iter : bitMapInfo) {
-      auto str = opt ? updateActiveStr(iter.first, ACTIVE_MASK(iter.second), condName, ACTIVE_UNIQUE(iter.second)) : updateActiveStr(iter.first, ACTIVE_MASK(iter.second));
+      auto str = opt ? updateActiveStr(iter.first, ACTIVE_MASK(iter.second), condName, ACTIVE_UNIQUE(iter.second), activeBufferName)
+                     : updateActiveStr(iter.first, ACTIVE_MASK(iter.second), activeBufferName);
       emitBodyLock(indent, "%s // %s\n", str.c_str(), ACTIVE_COMMENT(iter.second).c_str());
     }
   #ifdef PERF
@@ -895,12 +1722,13 @@ void graph::activateNext(Node* node, std::set<int>& nextNodeId, std::string oldN
   if (!opt) emitBodyLock(-- indent, "}\n");
 }
 
-void graph::activateUncondNext(Node* node, std::set<int>& activateId, bool inStep, std::string flagName, int indent) {
+void graph::activateUncondNext(Node* node, std::set<int>& activateId, bool inStep, std::string flagName,
+                               std::string activeBufferName, int indent) {
   std::map<uint64_t, ActiveType> bitMapInfo;
   auto curMask = activeSet2bitMap(activateId, bitMapInfo, node->super->cppId);
   if (ACTIVE_MASK(curMask) != 0) emitBodyLock(indent, "%s |= 0x%lx; // %s\n", flagName.c_str(), ACTIVE_MASK(curMask), ACTIVE_COMMENT(curMask).c_str());
   for (auto iter : bitMapInfo) {
-    emitBodyLock(indent, "%s // %s\n", updateActiveStr(iter.first, ACTIVE_MASK(iter.second)).c_str(), ACTIVE_COMMENT(iter.second).c_str());
+    emitBodyLock(indent, "%s // %s\n", updateActiveStr(iter.first, ACTIVE_MASK(iter.second), activeBufferName).c_str(), ACTIVE_COMMENT(iter.second).c_str());
   }
 #ifdef PERF
   #if ENABLE_ACTIVATOR
@@ -988,19 +1816,21 @@ bool Node::isLocal() { // TODO: isArray is OK
   return status == VALID_NODE && type == NODE_OTHERS && !anyNextActive() && !isArray() && !isReset();
 }
 
-int graph::translateInst(InstInfo inst, int indent, std::string flagName) {
+static std::map<Node*, std::string> mtRepCutActiveReplacements;
+
+int graph::translateInst(InstInfo inst, int indent, std::string flagName, std::string activeBufferName) {
   switch (inst.infoType) {
     case SUPER_INFO_IF:
-      emitBodyLock(indent ++, "%s\n", inst.inst.c_str());
+      emitBodyLock(indent ++, "%s\n", mtRepCutReplaceNodeNames(inst.inst, mtRepCutActiveReplacements).c_str());
       break;
     case SUPER_INFO_ELSE:
-      emitBodyLock(indent - 1,  "%s\n", inst.inst.c_str());
+      emitBodyLock(indent - 1,  "%s\n", mtRepCutReplaceNodeNames(inst.inst, mtRepCutActiveReplacements).c_str());
       break;
     case SUPER_INFO_DEDENT:
-      emitBodyLock(--indent, "%s\n", inst.inst.c_str());
+      emitBodyLock(--indent, "%s\n", mtRepCutReplaceNodeNames(inst.inst, mtRepCutActiveReplacements).c_str());
       break;
     case SUPER_INFO_STR:
-      emitBodyLock(indent, "%s\n", inst.inst.c_str());
+      emitBodyLock(indent, "%s\n", mtRepCutReplaceNodeNames(inst.inst, mtRepCutActiveReplacements).c_str());
       break;
     case SUPER_INFO_ASSIGN_BEG:
       if (inst.node->isLocal() || inst.node->isArray() || inst.node->type == NODE_WRITER) break;
@@ -1008,8 +1838,8 @@ int graph::translateInst(InstInfo inst, int indent, std::string flagName) {
       break;
     case SUPER_INFO_ASSIGN_END:
       if (inst.node->isLocal() || !inst.node->needActivate()) break;
-      if (inst.node->isArray() || inst.node->type == NODE_WRITER) activateUncondNext(inst.node, inst.node->nextActiveId, false, flagName, indent);
-      else activateNext(inst.node, inst.node->nextActiveId, oldName(inst.node), false, flagName, indent);
+      if (inst.node->isArray() || inst.node->type == NODE_WRITER) activateUncondNext(inst.node, inst.node->nextActiveId, false, flagName, activeBufferName, indent);
+      else activateNext(inst.node, inst.node->nextActiveId, oldName(inst.node), false, flagName, activeBufferName, indent);
       break;
     default:
       break;
@@ -1017,7 +1847,7 @@ int graph::translateInst(InstInfo inst, int indent, std::string flagName) {
   return indent;
 }
 
-void graph::genSuperEval(SuperNode* super, std::string flagName, int indent) { // current indent = 2
+void graph::genSuperEval(SuperNode* super, std::string flagName, std::string activeBufferName, int indent) { // current indent = 2
   if (super->superType == SUPER_EXTMOD) { // TODO: normalize
     /* save old EXT_OUT*/
     for (size_t i = 1; i < super->member.size(); i ++) {
@@ -1026,16 +1856,17 @@ void graph::genSuperEval(SuperNode* super, std::string flagName, int indent) { /
       emitBodyLock(indent, "%s %s = %s;\n", widthUType(extOut->width).c_str(), oldName(extOut).c_str(), extOut->name.c_str());
     }
     for (InstInfo inst : super->insts) {
-      indent = translateInst(inst, indent, flagName);
+      indent = translateInst(inst, indent, flagName, activeBufferName);
     }
     for (size_t i = 1; i < super->member.size(); i ++) {
       if (!super->member[i]->needActivate()) continue;
-      if (super->member[i]->isArray()) activateUncondNext(super->member[i], super->member[i]->nextActiveId, false, flagName, indent);
-      else activateNext(super->member[i], super->member[i]->nextActiveId, oldName(super->member[i]), false, flagName, indent);
+      if (super->member[i]->isArray()) activateUncondNext(super->member[i], super->member[i]->nextActiveId, false, flagName, activeBufferName, indent);
+      else activateNext(super->member[i], super->member[i]->nextActiveId, oldName(super->member[i]), false, flagName, activeBufferName, indent);
     }
   } else {
     if (super->superType == SUPER_ASYNC_RESET) {
-      emitBodyLock(indent, "subReset%d();\n", super2ResetId[super->resetNode].second);
+      if (activeBufferName.empty()) emitBodyLock(indent, "subReset%d();\n", super2ResetId[super->resetNode].second);
+      else emitBodyLock(indent, "subReset%d(%s);\n", super2ResetId[super->resetNode].second, activeBufferName.c_str());
     }
     /* local nodes definition */
     for (Node* n : super->member) {
@@ -1044,9 +1875,12 @@ void graph::genSuperEval(SuperNode* super, std::string flagName, int indent) { /
       }
     }
     for (InstInfo inst : super->insts) {
-      indent = translateInst(inst, indent, flagName);
+      indent = translateInst(inst, indent, flagName, activeBufferName);
     }
-    if (super->superType == SUPER_ASYNC_RESET) emitBodyLock(indent, "subReset%d();\n", super2ResetId[super->resetNode].second);
+    if (super->superType == SUPER_ASYNC_RESET) {
+      if (activeBufferName.empty()) emitBodyLock(indent, "subReset%d();\n", super2ResetId[super->resetNode].second);
+      else emitBodyLock(indent, "subReset%d(%s);\n", super2ResetId[super->resetNode].second, activeBufferName.c_str());
+    }
     emitBodyLock(indent, "#ifdef ENABLE_LOG\n");
     emitBodyLock(indent ++, "if (cycles >= LOG_START && cycles <= LOG_END) {\n");
     for (Node* n : super->member) nodeDisplay(n, indent);
@@ -1087,7 +1921,7 @@ int graph::genActivate() {
       SuperNode* super = cppId2Super[idx];
       std::string flagName = prevActiveWhole ? "oldFlag" : format("activeFlags[%d]", id);
       indent = genNodeStepStart(super, mask, idx, flagName, indent);
-      genSuperEval(super, flagName, indent);
+      genSuperEval(super, flagName, "", indent);
       indent = genNodeStepEnd(super, indent);
     }
     emitBodyLock(--indent, "}\n");
@@ -1096,15 +1930,137 @@ int graph::genActivate() {
     return nextSubStepIdx - 1; // return the maxinum subStepIdx currently used
 }
 
-void graph::genMtTaskHelper(SuperNode* super) {
-  emitFuncDecl(0, "void S%s::mtTask%d(uint%d_t &flag) {\n", name.c_str(), super->cppId, ACTIVE_WIDTH);
-  genSuperEval(super, "flag", 1);
+void graph::genMtTaskHelper(SuperNode* super, bool buffered) {
+  if (buffered) {
+    emitFuncDecl(0, "void S%s::mtTask%d(uint%d_t &flag, ActiveBuffer &nextActive) {\n", name.c_str(), super->cppId, ACTIVE_WIDTH);
+    genSuperEval(super, "flag", "nextActive", 1);
+  } else {
+    emitFuncDecl(0, "void S%s::mtTask%d(uint%d_t &flag) {\n", name.c_str(), super->cppId, ACTIVE_WIDTH);
+    genSuperEval(super, "flag", "", 1);
+  }
   emitBodyLock(0, "}\n");
 }
 
-int graph::genActivateSeqHelpers() {
+void graph::genMtRepCutLiteTaskHelper(SuperNode* super, const std::vector<MtRepCutClone>& clones) {
+  emitFuncDecl(0, "void S%s::mtRepCutLiteTask%d(uint%d_t &flag, ActiveBuffer &nextActive) {\n", name.c_str(), super->cppId, ACTIVE_WIDTH);
+  std::map<Node*, std::string> replacements = mtRepCutReplacementMap(clones);
+  for (const MtRepCutClone& clone : clones) {
+    emitBodyLock(1, "%s %s = %s;\n", widthUType(clone.sourceNode->width).c_str(), clone.cloneName.c_str(), clone.expr.c_str());
+  }
+  mtRepCutActiveReplacements = replacements;
+  genSuperEval(super, "flag", "nextActive", 1);
+  mtRepCutActiveReplacements.clear();
+  emitBodyLock(0, "}\n");
+}
+
+void graph::genMtTaskRunner(const MtRepCutSemanticPlan& semanticPlan) {
+  std::map<int, MtTaskInfo> mtTasks = buildMtTaskInfoMapWithRepCutSelection();
+  markMtRepCutLiteRuntimeApplied(mtTasks);
+  emitFuncDecl(0, "void S%s::mtRunPureBatch(int beginCppId, int endCppId, uint%d_t &activeWord) {\n", name.c_str(), ACTIVE_WIDTH);
+  emitBodyLock(1, "int taskCount = endCppId - beginCppId;\n");
+  emitBodyLock(1, "if (taskCount <= 0) return;\n");
+  emitBodyLock(1, "std::chrono::steady_clock::time_point mtProfileBatchBegin;\n");
+  emitBodyLock(1, "if (mtProfileEnabled) mtProfileBatchBegin = std::chrono::steady_clock::now();\n");
+  emitBodyLock(1, "const char *threadsEnv = getenv(\"GSIM_THREADS\");\n");
+  emitBodyLock(1, "int workerCount = threadsEnv == nullptr ? 1 : atoi(threadsEnv);\n");
+  emitBodyLock(1, "if (workerCount < 1) workerCount = 1;\n");
+  bool hasForcedSerialBatch = false;
+  for (const MtRepCutBatch& batch : semanticPlan.cutBatches) {
+    if (batch.forcedSerial) hasForcedSerialBatch = true;
+  }
+  if (hasForcedSerialBatch) {
+    emitBodyLock(1, "switch (beginCppId) {\n");
+    for (const MtRepCutBatch& batch : semanticPlan.cutBatches) {
+      if (batch.forcedSerial) emitBodyLock(2, "case %d:\n", batch.beginCppId);
+    }
+    emitBodyLock(3, "workerCount = 1;\n");
+    emitBodyLock(3, "break;\n");
+    emitBodyLock(2, "default:\n");
+    emitBodyLock(3, "break;\n");
+    emitBodyLock(1, "}\n");
+  }
+  emitBodyLock(1, "if (workerCount > taskCount) workerCount = taskCount;\n");
+  emitBodyLock(1, "if (mtProfileEnabled && workerCount > mtProfileMaxWorkerCount) mtProfileMaxWorkerCount = workerCount;\n");
+  emitBodyLock(1, "if (mtProfileEnabled && mtProfileWorkerTaskCount.size() < (size_t)workerCount) mtProfileWorkerTaskCount.resize((size_t)workerCount, 0);\n");
+  emitBodyLock(1, "if (mtProfileEnabled) mtProfilePureBatchCount ++;\n");
+  emitBodyLock(1, "std::vector<uint64_t> mtProfileLocalWorkerTaskCount(workerCount, 0);\n");
+  emitBodyLock(1, "std::vector<std::vector<uint64_t>> mtProfileLocalTaskExec;\n");
+  emitBodyLock(1, "if (mtProfileEnabled) mtProfileLocalTaskExec.assign(workerCount, std::vector<uint64_t>(%d, 0));\n", superId);
+  emitBodyLock(1, "std::vector<ActiveBuffer> workerBuffers(workerCount);\n");
+  emitBodyLock(1, "for (int worker = 0; worker < workerCount; worker ++) workerBuffers[worker].clear();\n");
+  emitBodyLock(1, "std::vector<uint%d_t> workerFlags(workerCount, activeWord);\n", ACTIVE_WIDTH);
+  if (!semanticPlan.cutBatches.empty()) {
+    emitBodyLock(1, "switch (beginCppId) {\n");
+    for (const MtRepCutBatch& batch : semanticPlan.cutBatches) {
+      uint64_t forcedSinkMask = mtRepCutForcedSinkMaskForBatch(semanticPlan, batch.beginCppId);
+      if (forcedSinkMask != 0) {
+        emitBodyLock(2, "case %d:\n", batch.beginCppId);
+        emitBodyLock(3, "for (int worker = 0; worker < workerCount; worker ++) workerFlags[worker] |= 0x%lx;\n", forcedSinkMask);
+        emitBodyLock(3, "break;\n");
+      }
+    }
+    emitBodyLock(2, "default:\n");
+    emitBodyLock(3, "break;\n");
+    emitBodyLock(1, "}\n");
+  }
+  emitBodyLock(1, "auto runWorker = [&](int worker, int chunkBegin, int chunkEnd) {\n");
+  emitBodyLock(2, "for (int cppId = chunkBegin; cppId < chunkEnd; cppId ++) {\n");
+  emitBodyLock(3, "switch (cppId) {\n");
+  for (int cppId = 0; cppId < superId; cppId ++) {
+    if (mtTasks[cppId].taskKind != "pure_compute") continue;
+    emitBodyLock(4, "case %d:\n", cppId);
+    emitBodyLock(5, "if (workerFlags[worker] & 0x%lx) {\n", (uint64_t)1 << (cppId % ACTIVE_WIDTH));
+    emitBodyLock(6, "std::chrono::steady_clock::time_point mtProfileTaskBegin;\n");
+    emitBodyLock(6, "if (mtProfileEnabled) mtProfileTaskBegin = std::chrono::steady_clock::now();\n");
+    if (mtTasks[cppId].repcutRuntimeApplied) {
+      emitBodyLock(6, "mtRepCutLiteTask%d(workerFlags[worker], workerBuffers[worker]);\n", cppId);
+    } else {
+      emitBodyLock(6, "mtTask%d(workerFlags[worker], workerBuffers[worker]);\n", cppId);
+    }
+    emitBodyLock(6, "if (mtProfileEnabled) {\n");
+    emitBodyLock(7, "mtProfileLocalTaskExec[worker][%d] ++;\n", cppId);
+    emitBodyLock(7, "mtProfileLocalWorkerTaskCount[worker] ++;\n");
+    emitBodyLock(6, "}\n");
+    emitBodyLock(5, "}\n");
+    emitBodyLock(5, "break;\n");
+  }
+  emitBodyLock(4, "default:\n");
+  emitBodyLock(5, "break;\n");
+  emitBodyLock(3, "}\n");
+  emitBodyLock(2, "}\n");
+  emitBodyLock(1, "};\n");
+  emitBodyLock(1, "if (workerCount == 1) {\n");
+  emitBodyLock(2, "runWorker(0, beginCppId, endCppId);\n");
+  emitBodyLock(1, "} else {\n");
+  emitBodyLock(2, "std::vector<std::thread> workers;\n");
+  emitBodyLock(2, "workers.reserve(workerCount);\n");
+  emitBodyLock(2, "for (int worker = 0; worker < workerCount; worker ++) {\n");
+  emitBodyLock(3, "int chunkBegin = beginCppId + (taskCount * worker) / workerCount;\n");
+  emitBodyLock(3, "int chunkEnd = beginCppId + (taskCount * (worker + 1)) / workerCount;\n");
+  emitBodyLock(3, "workers.emplace_back([&, worker, chunkBegin, chunkEnd]() { runWorker(worker, chunkBegin, chunkEnd); });\n");
+  emitBodyLock(2, "}\n");
+  emitBodyLock(2, "for (std::thread &worker : workers) worker.join();\n");
+  emitBodyLock(1, "}\n");
+  emitBodyLock(1, "std::chrono::steady_clock::time_point mtProfileMergeBegin;\n");
+  emitBodyLock(1, "if (mtProfileEnabled) mtProfileMergeBegin = std::chrono::steady_clock::now();\n");
+  emitBodyLock(1, "for (int worker = 0; worker < workerCount; worker ++) activeWord |= workerFlags[worker];\n");
+  emitBodyLock(1, "for (int worker = 0; worker < workerCount; worker ++) workerBuffers[worker].mergeFrom(activeFlags);\n");
+  emitBodyLock(1, "if (mtProfileEnabled) {\n");
+  emitBodyLock(2, "for (int worker = 0; worker < workerCount; worker ++) {\n");
+  emitBodyLock(3, "mtProfileWorkerTaskCount[(size_t)worker] += mtProfileLocalWorkerTaskCount[worker];\n");
+  emitBodyLock(3, "mtProfilePureTasks += mtProfileLocalWorkerTaskCount[worker];\n");
+  emitBodyLock(3, "for (int cppId = 0; cppId < %d; cppId ++) mtProfileTaskExecCount[cppId] += mtProfileLocalTaskExec[worker][cppId];\n", superId);
+  emitBodyLock(2, "}\n");
+  emitBodyLock(1, "}\n");
+  emitBodyLock(1, "if (mtProfileEnabled) mtProfileMergeWallNs += std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - mtProfileMergeBegin).count();\n");
+  emitBodyLock(1, "if (mtProfileEnabled) mtProfileBatchWallNs += std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - mtProfileBatchBegin).count();\n");
+  emitBodyLock(0, "}\n");
+}
+
+int graph::genActivateSeqHelpers(bool buffered) {
+    std::map<int, MtTaskInfo> mtTasks = buildMtTaskInfoMapWithRepCut();
     for (int idx = 0; idx < superId; idx ++) {
-      genMtTaskHelper(cppId2Super[idx]);
+      genMtTaskHelper(cppId2Super[idx], buffered);
     }
 
     emitFuncDecl(0, "void S%s::subStep0() {\n", name.c_str());
@@ -1132,12 +2088,30 @@ int graph::genActivateSeqHelpers() {
           }
           emitBodyLock(indent, "uint%d_t oldFlag = activeFlags[%d];\n", ACTIVE_WIDTH, id);
           emitBodyLock(indent, "activeFlags[%d] = 0;\n", id);
+          emitBodyLock(indent, "if (mtProfileEnabled) mtProfileActiveWordCount ++;\n");
+        } else if (buffered) {
+          emitBodyLock(indent, "uint%d_t activeWord%d = activeFlags[%d];\n", ACTIVE_WIDTH, id, id);
         }
       }
       SuperNode* super = cppId2Super[idx];
-      std::string flagName = prevActiveWhole ? "oldFlag" : format("activeFlags[%d]", id);
+      std::string flagName = prevActiveWhole ? "oldFlag" : (buffered ? format("activeWord%d", id) : format("activeFlags[%d]", id));
       indent = genNodeStepStart(super, mask, idx, flagName, indent);
-      emitBodyLock(indent, "mtTask%d(%s);\n", idx, flagName.c_str());
+      if (buffered) {
+        emitBodyLock(indent, "ActiveBuffer mtBuffer;\n");
+        emitBodyLock(indent, "mtBuffer.clear();\n");
+        emitBodyLock(indent, "std::chrono::steady_clock::time_point mtProfileTaskBegin;\n");
+        emitBodyLock(indent, "if (mtProfileEnabled) mtProfileTaskBegin = std::chrono::steady_clock::now();\n");
+        emitBodyLock(indent, "mtTask%d(%s, mtBuffer);\n", idx, flagName.c_str());
+        emitBodyLock(indent, "recordMtProfileTask(%d, %s, mtProfileEnabled ? std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - mtProfileTaskBegin).count() : 0);\n",
+                     idx, mtTasks[idx].taskKind == "pure_compute" ? "true" : "false");
+        emitBodyLock(indent, "mtBuffer.mergeFrom(activeFlags);\n");
+      } else {
+        emitBodyLock(indent, "std::chrono::steady_clock::time_point mtProfileTaskBegin;\n");
+        emitBodyLock(indent, "if (mtProfileEnabled) mtProfileTaskBegin = std::chrono::steady_clock::now();\n");
+        emitBodyLock(indent, "mtTask%d(%s);\n", idx, flagName.c_str());
+        emitBodyLock(indent, "recordMtProfileTask(%d, %s, mtProfileEnabled ? std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - mtProfileTaskBegin).count() : 0);\n",
+                     idx, mtTasks[idx].taskKind == "pure_compute" ? "true" : "false");
+      }
       indent = genNodeStepEnd(super, indent);
     }
     emitBodyLock(--indent, "}\n");
@@ -1146,14 +2120,86 @@ int graph::genActivateSeqHelpers() {
     return nextSubStepIdx - 1;
 }
 
-void graph::genResetDef(SuperNode* super, bool isUIntReset, int indent) {
-  emitBodyLock(indent ++, "void S%s::subReset%d(){ // %s reset\n", name.c_str(), resetFuncNum, isUIntReset ? "uint" : "async");
-  if (super2ResetId.find(super->resetNode) != super2ResetId.end()) {
-    super2ResetId[super->resetNode] = std::make_pair(-1, -1);
-  }
-  if (isUIntReset) super2ResetId[super->resetNode].first = resetFuncNum;
-  else super2ResetId[super->resetNode].second = resetFuncNum;
-  resetFuncNum ++;
+int graph::genActivateMtHelpers() {
+    std::map<int, MtTaskInfo> mtTasks = buildMtTaskInfoMapWithRepCutSelection();
+    markMtRepCutLiteRuntimeApplied(mtTasks);
+    MtRepCutSemanticPlan semanticPlan = planMtRepCutSemantics(mtTasks);
+    MtPureBatchPlan batchPlan = semanticPlan.batchPlan;
+    std::map<int, int> batchEndByStart;
+    for (auto batch : batchPlan.batches) {
+      batchEndByStart[batch.first] = batch.second;
+    }
+    for (int idx = 0; idx < superId; idx ++) {
+      genMtTaskHelper(cppId2Super[idx], true);
+    }
+    for (int idx = 0; idx < superId; idx ++) {
+      if (mtTasks[idx].repcutRuntimeApplied) genMtRepCutLiteTaskHelper(cppId2Super[idx], mtRepCutClonesForSink(semanticPlan, idx));
+    }
+    genMtTaskRunner(semanticPlan);
+
+    emitFuncDecl(0, "void S%s::subStep0() {\n", name.c_str());
+    int indent = 1;
+    int nextSubStepIdx = 1;
+    std::string nextFuncDef = format("void S%s::subStep%d()", name.c_str(), nextSubStepIdx);
+    bool prevActiveWhole = false;
+    for (int idx = 0; idx < superId; idx ++) {
+      int id;
+      uint64_t mask;
+      std::tie(id, mask) = setIdxMask(idx);
+      int offset = idx % ACTIVE_WIDTH;
+      if (offset == 0) {
+        if (prevActiveWhole) {
+          emitBodyLock(--indent, "}\n");
+        }
+        prevActiveWhole = true;
+        for (int j = 0; j < ACTIVE_WIDTH && idx + j < superId; j ++) {
+          if (isAlwaysActive(idx + j)) prevActiveWhole = false;
+        }
+        if (prevActiveWhole) {
+          bool newFile = __emitSrc(indent ++, true, false, nextFuncDef.c_str(), "if(unlikely(activeFlags[%d] != 0)) {\n", id);
+          if (newFile) {
+            nextFuncDef = format("void S%s::subStep%d()", name.c_str(), ++ nextSubStepIdx);
+          }
+          emitBodyLock(indent, "uint%d_t oldFlag = activeFlags[%d];\n", ACTIVE_WIDTH, id);
+          emitBodyLock(indent, "activeFlags[%d] = 0;\n", id);
+          emitBodyLock(indent, "if (mtProfileEnabled) mtProfileActiveWordCount ++;\n");
+        } else {
+          emitBodyLock(indent, "uint%d_t activeWord%d = activeFlags[%d];\n", ACTIVE_WIDTH, id, id);
+        }
+      }
+
+      auto batchIter = batchEndByStart.find(idx);
+      if (prevActiveWhole && batchIter != batchEndByStart.end()) {
+        int batchEnd = batchIter->second;
+        if (batchEnd - idx > 1) {
+          emitBodyLock(indent, "mtRunPureBatch(%d, %d, oldFlag);\n", idx, batchEnd);
+          idx = batchEnd - 1;
+          continue;
+        }
+      }
+
+      SuperNode* super = cppId2Super[idx];
+      std::string flagName = prevActiveWhole ? "oldFlag" : format("activeWord%d", id);
+      indent = genNodeStepStart(super, mask, idx, flagName, indent);
+      emitBodyLock(indent, "ActiveBuffer mtBuffer;\n");
+      emitBodyLock(indent, "mtBuffer.clear();\n");
+      emitBodyLock(indent, "std::chrono::steady_clock::time_point mtProfileTaskBegin;\n");
+      emitBodyLock(indent, "if (mtProfileEnabled) mtProfileTaskBegin = std::chrono::steady_clock::now();\n");
+      emitBodyLock(indent, "mtTask%d(%s, mtBuffer);\n", idx, flagName.c_str());
+      emitBodyLock(indent, "recordMtProfileTask(%d, %s, mtProfileEnabled ? std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - mtProfileTaskBegin).count() : 0);\n",
+                   idx, mtTasks[idx].taskKind == "pure_compute" ? "true" : "false");
+      emitBodyLock(indent, "mtBuffer.mergeFrom(activeFlags);\n");
+      indent = genNodeStepEnd(super, indent);
+    }
+    emitBodyLock(--indent, "}\n");
+    if (prevActiveWhole) emitBodyLock(--indent, "}\n");
+
+    return nextSubStepIdx - 1;
+}
+
+void graph::genResetDef(SuperNode* super, bool isUIntReset, bool buffered, int resetId, int indent) {
+  if (buffered) emitBodyLock(indent ++, "void S%s::subReset%d(ActiveBuffer &nextActive){ // %s reset\n", name.c_str(), resetId, isUIntReset ? "uint" : "async");
+  else emitBodyLock(indent ++, "void S%s::subReset%d(){ // %s reset\n", name.c_str(), resetId, isUIntReset ? "uint" : "async");
   std::string resetName = super->resetNode->type == NODE_REG_SRC ? RESET_NAME(super->resetNode).c_str() : super->resetNode->name.c_str();
   emitBodyLock(indent ++, "if(unlikely(%s)) {\n", resetName.c_str());
   std::set<int> allNext;
@@ -1165,12 +2211,15 @@ void graph::genResetDef(SuperNode* super, bool isUIntReset, int indent) {
     }
   }
 
-  if (allNext.size() > 100) emitBodyLock(indent, "activateAll();\n");
+  if (allNext.size() > 100) {
+    if (buffered) emitBodyLock(indent, "nextActive.activateAll();\n");
+    else emitBodyLock(indent, "activateAll();\n");
+  }
   else {
     std::map<uint64_t, ActiveType> bitMapInfo;
     activeSet2bitMap(allNext, bitMapInfo, -1);
     for (auto iter : bitMapInfo) {
-      emitBodyLock(indent, "%s // %s\n", updateActiveStr(iter.first, ACTIVE_MASK(iter.second)).c_str(), ACTIVE_COMMENT(iter.second).c_str());
+      emitBodyLock(indent, "%s // %s\n", updateActiveStr(iter.first, ACTIVE_MASK(iter.second), buffered ? "nextActive" : "").c_str(), ACTIVE_COMMENT(iter.second).c_str());
     }
   }
   emitBodyLock(-- indent, "}\n");
@@ -1204,7 +2253,17 @@ void graph::genResetAll() {
       Assert(mpz_sgn(super->resetNode->computeInfo->consVal) == 0, "reset %s is always true", super->resetNode->name.c_str());
       continue;
     }
-    genResetDef(super, super->superType == SUPER_UINT_RESET, 0);
+    if (super2ResetId.find(super->resetNode) != super2ResetId.end()) {
+      super2ResetId[super->resetNode] = std::make_pair(-1, -1);
+    }
+    int resetId = resetFuncNum ++;
+    bool isUIntReset = super->superType == SUPER_UINT_RESET;
+    if (isUIntReset) super2ResetId[super->resetNode].first = resetId;
+    else super2ResetId[super->resetNode].second = resetId;
+    genResetDef(super, isUIntReset, false, resetId, 0);
+    if (globalConfig.MtHelperMode == "buffered-seq" || globalConfig.MtHelperMode == "mt") {
+      genResetDef(super, isUIntReset, true, resetId, 0);
+    }
     resetSuper.push_back(super);
   }
 
@@ -1218,6 +2277,8 @@ void graph::genResetAll() {
 
 void graph::genStep(int subStepIdxMax) {
   emitFuncDecl(0, "void S%s::step() {\n", name.c_str());
+  emitBodyLock(1, "std::chrono::steady_clock::time_point mtProfileStepBegin;\n");
+  emitBodyLock(1, "if (mtProfileEnabled) mtProfileStepBegin = std::chrono::steady_clock::now();\n");
   emitBodyLock(1, "resetAll();\n");
   for (SuperNode* super : sortedSuper) {
     for (Node* member : super->member) {
@@ -1231,6 +2292,7 @@ void graph::genStep(int subStepIdxMax) {
   }
 
   emitBodyLock(1, "cycles ++;\n");
+  emitBodyLock(1, "if (mtProfileEnabled) mtProfileTotalStepNs += std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - mtProfileStepBegin).count();\n");
   emitBodyLock(0, "}\n");
 }
 
@@ -1326,6 +2388,7 @@ void graph::cppEmitter() {
     }
   }
   if (globalConfig.DumpMtScheduleJson) dumpMtScheduleJson();
+  if (globalConfig.DumpMtRepCutLiteReport || globalConfig.MtRepCutLiteMode == "on") dumpMtRepCutLiteReport();
 
   srcFp = NULL;
   srcFileIdx = 0;
@@ -1336,10 +2399,36 @@ void graph::cppEmitter() {
 #endif
 
   /* class start*/
+  bool useMtHelpers = globalConfig.MtHelperMode == "mt";
+  bool useSeqHelpers = globalConfig.MtHelperMode == "seq" ||
+                       globalConfig.MtHelperMode == "buffered-seq";
+  bool useBufferedHelpers = globalConfig.MtHelperMode == "buffered-seq" || useMtHelpers;
+  bool useHelperTasks = useSeqHelpers || useMtHelpers;
+  std::map<int, MtTaskInfo> mtRepCutHeaderTasks;
+  if (useMtHelpers) {
+    mtRepCutHeaderTasks = buildMtTaskInfoMapWithRepCutSelection();
+    markMtRepCutLiteRuntimeApplied(mtRepCutHeaderTasks);
+  }
+  if (useBufferedHelpers) emitActiveBufferDef(header, activeFlagNum);
+
   fprintf(header, "class S%s {\npublic:\n", name.c_str());
   fprintf(header, "uint64_t cycles;\n");
   fprintf(header, "uint64_t LOG_START, LOG_END;\n");
   fprintf(header, "uint%d_t activeFlags[%d];\n", ACTIVE_WIDTH, activeFlagNum); // or super.size() if id == idx
+  fprintf(header, "bool mtProfileEnabled;\n");
+  fprintf(header, "const char *mtProfileHelperMode;\n");
+  fprintf(header, "int mtProfileConfiguredWorkerCount;\n");
+  fprintf(header, "int mtProfileMaxWorkerCount;\n");
+  fprintf(header, "uint64_t mtProfileActiveWordCount;\n");
+  fprintf(header, "uint64_t mtProfileSerialTasks;\n");
+  fprintf(header, "uint64_t mtProfilePureTasks;\n");
+  fprintf(header, "uint64_t mtProfilePureBatchCount;\n");
+  fprintf(header, "uint64_t mtProfileBatchWallNs;\n");
+  fprintf(header, "uint64_t mtProfileSerialWallNs;\n");
+  fprintf(header, "uint64_t mtProfileMergeWallNs;\n");
+  fprintf(header, "uint64_t mtProfileTotalStepNs;\n");
+  fprintf(header, "uint64_t mtProfileTaskExecCount[%d];\n", superId);
+  fprintf(header, "std::vector<uint64_t> mtProfileWorkerTaskCount;\n");
 #ifdef PERF
   fprintf(header, "size_t activeTimes[%d];\n", superId);
 #if ENABLE_ACTIVATOR
@@ -1354,6 +2443,7 @@ void graph::cppEmitter() {
                "  cycles = 0;\n"
                "  LOG_START = 1;\n"
                "  LOG_END = 0;\n"
+               "  initMtProfile();\n"
                "  init();\n"
                "}\n", name.c_str(), name.c_str());
 
@@ -1406,8 +2496,66 @@ void graph::cppEmitter() {
                "#endif\n");
 
   fprintf(header, "S%s();\n", name.c_str());
+  fprintf(header, "~S%s();\n", name.c_str());
   fprintf(header, "void init();\n");
+  fprintf(header, "void initMtProfile();\n");
+  fprintf(header, "void dumpMtProfile();\n");
+  fprintf(header, "void recordMtProfileTask(int cppId, bool pureTask, uint64_t elapsedNs);\n");
+  fprintf(header, "void recordMtProfileWorkerTask(int worker);\n");
 
+  emitBodyLock(0, "}\n");
+
+  emitFuncDecl(0, "void S%s::initMtProfile() {\n", name.c_str());
+  emitBodyLock(1, "const char *profileEnv = getenv(\"GSIM_MT_PROFILE\");\n");
+  emitBodyLock(1, "mtProfileEnabled = profileEnv != nullptr && profileEnv[0] != '\\0' && profileEnv[0] != '0';\n");
+  emitBodyLock(1, "mtProfileHelperMode = \"%s\";\n", globalConfig.MtHelperMode.c_str());
+  emitBodyLock(1, "const char *threadsEnv = getenv(\"GSIM_THREADS\");\n");
+  emitBodyLock(1, "mtProfileConfiguredWorkerCount = threadsEnv == nullptr ? 1 : atoi(threadsEnv);\n");
+  emitBodyLock(1, "if (mtProfileConfiguredWorkerCount < 1) mtProfileConfiguredWorkerCount = 1;\n");
+  emitBodyLock(1, "mtProfileMaxWorkerCount = 1;\n");
+  emitBodyLock(1, "mtProfileActiveWordCount = 0;\n");
+  emitBodyLock(1, "mtProfileSerialTasks = 0;\n");
+  emitBodyLock(1, "mtProfilePureTasks = 0;\n");
+  emitBodyLock(1, "mtProfilePureBatchCount = 0;\n");
+  emitBodyLock(1, "mtProfileBatchWallNs = 0;\n");
+  emitBodyLock(1, "mtProfileSerialWallNs = 0;\n");
+  emitBodyLock(1, "mtProfileMergeWallNs = 0;\n");
+  emitBodyLock(1, "mtProfileTotalStepNs = 0;\n");
+  emitBodyLock(1, "for (int i = 0; i < %d; i ++) mtProfileTaskExecCount[i] = 0;\n", superId);
+  emitBodyLock(1, "mtProfileWorkerTaskCount.assign((size_t)mtProfileConfiguredWorkerCount, 0);\n");
+  emitBodyLock(0, "}\n");
+
+  emitFuncDecl(0, "S%s::~S%s() {\n", name.c_str(), name.c_str());
+  emitBodyLock(1, "dumpMtProfile();\n");
+  emitBodyLock(0, "}\n");
+
+  emitFuncDecl(0, "void S%s::recordMtProfileTask(int cppId, bool pureTask, uint64_t elapsedNs) {\n", name.c_str());
+  emitBodyLock(1, "if (!mtProfileEnabled) return;\n");
+  emitBodyLock(1, "if (cppId >= 0 && cppId < %d) mtProfileTaskExecCount[cppId] ++;\n", superId);
+  emitBodyLock(1, "if (pureTask) mtProfilePureTasks ++;\n");
+  emitBodyLock(1, "else mtProfileSerialTasks ++;\n");
+  emitBodyLock(1, "if (!pureTask) mtProfileSerialWallNs += elapsedNs;\n");
+  emitBodyLock(0, "}\n");
+
+  emitFuncDecl(0, "void S%s::recordMtProfileWorkerTask(int worker) {\n", name.c_str());
+  emitBodyLock(1, "if (!mtProfileEnabled) return;\n");
+  emitBodyLock(1, "if (worker >= 0 && (size_t)worker < mtProfileWorkerTaskCount.size()) mtProfileWorkerTaskCount[(size_t)worker] ++;\n");
+  emitBodyLock(0, "}\n");
+
+  emitFuncDecl(0, "void S%s::dumpMtProfile() {\n", name.c_str());
+  emitBodyLock(1, "if (!mtProfileEnabled) return;\n");
+  emitBodyLock(1, "fprintf(stderr, \"[mt-profile] helper_mode=%%s worker_count=%%d max_worker_count=%%d cycles=%%lu active_word_count=%%lu serial_tasks=%%lu pure_tasks=%%lu pure_batch_count=%%lu batch_wall_ns=%%lu serial_wall_ns=%%lu merge_wall_ns=%%lu total_step_ns=%%lu\\n\", mtProfileHelperMode, mtProfileConfiguredWorkerCount, mtProfileMaxWorkerCount, cycles, mtProfileActiveWordCount, mtProfileSerialTasks, mtProfilePureTasks, mtProfilePureBatchCount, mtProfileBatchWallNs, mtProfileSerialWallNs, mtProfileMergeWallNs, mtProfileTotalStepNs);\n");
+  emitBodyLock(1, "fprintf(stderr, \"[mt-profile] worker_task_count=\");\n");
+  emitBodyLock(1, "for (size_t i = 0; i < mtProfileWorkerTaskCount.size(); i ++) fprintf(stderr, \"%%s%%lu\", i == 0 ? \"\" : \",\", mtProfileWorkerTaskCount[i]);\n");
+  emitBodyLock(1, "fprintf(stderr, \"\\n\");\n");
+  emitBodyLock(1, "fprintf(stderr, \"[mt-profile] task_cpp_ids=\");\n");
+  emitBodyLock(1, "bool firstTask = true;\n");
+  emitBodyLock(1, "for (int i = 0; i < %d; i ++) {\n", superId);
+  emitBodyLock(2, "if (mtProfileTaskExecCount[i] == 0) continue;\n");
+  emitBodyLock(2, "fprintf(stderr, \"%%s%%d:%%lu\", firstTask ? \"\" : \",\", i, mtProfileTaskExecCount[i]);\n");
+  emitBodyLock(2, "firstTask = false;\n");
+  emitBodyLock(1, "}\n");
+  emitBodyLock(1, "fprintf(stderr, \"\\n\");\n");
   emitBodyLock(0, "}\n");
 
   /* activation all nodes for reset */
@@ -1431,17 +2579,27 @@ void graph::cppEmitter() {
   genResetAll();
   for (int i = 0; i < resetFuncNum; i ++) {
     fprintf(header, "void subReset%d();\n", i);
+    if (useBufferedHelpers) fprintf(header, "void subReset%d(ActiveBuffer &nextActive);\n", i);
   }
 
   /* main evaluation loop (step) */
-  int subStepIdxMax = globalConfig.MtHelperMode == "seq" ? genActivateSeqHelpers() : genActivate();
+  int subStepIdxMax = useMtHelpers ? genActivateMtHelpers() : (useSeqHelpers ? genActivateSeqHelpers(useBufferedHelpers) : genActivate());
   for (int i = 0; i <= subStepIdxMax; i ++) {
     fprintf(header, "void subStep%d();\n", i);
   }
-  if (globalConfig.MtHelperMode == "seq") {
+  if (useHelperTasks) {
     for (int i = 0; i < superId; i ++) {
-      fprintf(header, "void mtTask%d(uint%d_t &flag);\n", i, ACTIVE_WIDTH);
+      if (useBufferedHelpers) fprintf(header, "void mtTask%d(uint%d_t &flag, ActiveBuffer &nextActive);\n", i, ACTIVE_WIDTH);
+      else fprintf(header, "void mtTask%d(uint%d_t &flag);\n", i, ACTIVE_WIDTH);
     }
+    if (useMtHelpers) {
+      for (int i = 0; i < superId; i ++) {
+        if (mtRepCutHeaderTasks[i].repcutRuntimeApplied) {
+          fprintf(header, "void mtRepCutLiteTask%d(uint%d_t &flag, ActiveBuffer &nextActive);\n", i, ACTIVE_WIDTH);
+        }
+      }
+    }
+    if (useMtHelpers) fprintf(header, "void mtRunPureBatch(int beginCppId, int endCppId, uint%d_t &activeWord);\n", ACTIVE_WIDTH);
   }
 
   /* step wrapper */

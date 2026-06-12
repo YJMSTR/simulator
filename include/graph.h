@@ -5,6 +5,9 @@
 #ifndef GRAPH_H
 #define GRAPH_H
 
+struct MtRepCutClone;
+struct MtRepCutSemanticPlan;
+
 class graph {
   FILE *srcFp;
   int srcFileIdx;
@@ -12,8 +15,10 @@ class graph {
 
   bool __emitSrc(int indent, bool canNewFile, bool alreadyEndFunc, const char *nextFuncDef, const char *fmt, ...);
   void emitPrintf();
-  void activateNext(Node* node, std::set<int>& nextNodeId, std::string oldName, bool inStep, std::string flagName, int indent);
-  void activateUncondNext(Node* node, std::set<int>& activateId, bool inStep, std::string flagName, int indent);
+  void activateNext(Node* node, std::set<int>& nextNodeId, std::string oldName, bool inStep, std::string flagName,
+                    std::string activeBufferName, int indent);
+  void activateUncondNext(Node* node, std::set<int>& activateId, bool inStep, std::string flagName,
+                          std::string activeBufferName, int indent);
 
   FILE* genHeaderStart();
   void genNodeDef(FILE* fp, Node* node);
@@ -31,13 +36,16 @@ class graph {
   void genMemWrite(FILE* fp);
   void saveDiffRegs();
   void genResetAll();
-  void genResetDef(SuperNode* super, bool isUIntReset, int indent);
+  void genResetDef(SuperNode* super, bool isUIntReset, bool buffered, int resetId, int indent);
   void genResetActivation(SuperNode* super, bool isUIntReset, int indent, int resetId);
   void genResetDecl(FILE* fp);
-  int translateInst(InstInfo inst, int indent, std::string flagName);
-  void genSuperEval(SuperNode* super, std::string flagName, int indent);
-  void genMtTaskHelper(SuperNode* super);
-  int genActivateSeqHelpers();
+  int translateInst(InstInfo inst, int indent, std::string flagName, std::string activeBufferName);
+  void genSuperEval(SuperNode* super, std::string flagName, std::string activeBufferName, int indent);
+  void genMtTaskHelper(SuperNode* super, bool buffered);
+  void genMtRepCutLiteTaskHelper(SuperNode* super, const std::vector<MtRepCutClone>& clones);
+  void genMtTaskRunner(const MtRepCutSemanticPlan& semanticPlan);
+  int genActivateSeqHelpers(bool buffered);
+  int genActivateMtHelpers();
   void removeNodesNoConnect(NodeStatus status);
   void reconnectSuper();
   void reconnectAll();
@@ -86,6 +94,7 @@ class graph {
   void instsGenerator();
   void cppEmitter();
   void dumpMtScheduleJson();
+  void dumpMtRepCutLiteReport();
   void usedBits();
   void traversal();
   void traversalNoTree();

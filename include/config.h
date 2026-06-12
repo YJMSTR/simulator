@@ -8,11 +8,16 @@ struct Config {
   bool DumpAssignTree;
   bool DumpConstStatus;
   bool DumpMtScheduleJson;
+  bool DumpMtRepCutLiteReport;
+  bool DisableReplicationOpt;
   std::string MtHelperMode;
+  std::string MtRepCutLiteMode;
   std::string OutputDir;
   std::string InputBaseName;
   int SuperNodeMaxSize;
   uint32_t cppMaxSizeKB;
+  int MtRepCutCopyBudget;
+  int MtRepCutFanoutBudget;
   std::string sep_module;
   std::string sep_aggr;
   int MergeWhenSize;

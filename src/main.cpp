@@ -10,6 +10,8 @@
 
 #include <sstream>
 #include <string>
+#include <cerrno>
+#include <cstdint>
 #include <getopt.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
@@ -40,11 +42,16 @@ Config::Config() {
   DumpAssignTree = false;
   DumpConstStatus = false;
   DumpMtScheduleJson = false;
+  DumpMtRepCutLiteReport = false;
+  DisableReplicationOpt = false;
   MtHelperMode = "off";
+  MtRepCutLiteMode = "off";
   OutputDir = ".";
   InputBaseName = "";
   SuperNodeMaxSize = 35;
   cppMaxSizeKB = -1;
+  MtRepCutCopyBudget = 0;
+  MtRepCutFanoutBudget = 0;
   sep_module = "$";
   sep_aggr = "$$";
   MergeWhenSize = 5;
@@ -74,6 +81,16 @@ static std::string basenameNoExt(const char* path) {
   size_t dot = name.find_last_of('.');
   if (dot != std::string::npos) name = name.substr(0, dot);
   return name;
+}
+
+static bool parseNonNegativeInt(const char* text, int& value) {
+  if (text == nullptr || text[0] == '\0') return false;
+  char* end = nullptr;
+  errno = 0;
+  long parsed = strtol(text, &end, 10);
+  if (errno != 0 || end == text || *end != '\0' || parsed < 0 || parsed > INT32_MAX) return false;
+  value = static_cast<int>(parsed);
+  return true;
 }
 
 
@@ -129,7 +146,14 @@ static void printUsage(const char* ProgName) {
             << "      --dump-assign-tree           Include assignTree structure in JSON dump (can be large).\n"
             << "      --dump-const-status          Dump per-node constant-analysis status before removing constants.\n"
             << "      --dump-mt-schedule-json      Dump gsim-mt schedule metadata JSON without changing generated model behavior.\n"
-            << "      --mt-helper-mode=off|seq     Emit gsim-mt per-super helpers; off is the default.\n"
+            << "      --mt-helper-mode=off|seq|buffered-seq|mt\n"
+            << "                                      Emit gsim-mt per-super helpers; off is the default.\n"
+            << "                                      mt emits a bounded scan-order-preserving threaded helper runtime.\n"
+            << "      --mt-repcut-lite=off|on       Enable bounded RepCut-lite candidate selection; off is the default.\n"
+            << "      --mt-repcut-copy-budget=N     Total RepCut-lite copy cost budget; default 0.\n"
+            << "      --mt-repcut-fanout-budget=N   Per-candidate RepCut-lite fanout budget; default 0.\n"
+            << "      --dump-mt-repcut-lite-report  Write a deterministic RepCut-lite candidate report JSON.\n"
+            << "      --disable-replication-opt     Skip the existing gsim replicationOpt pass.\n"
             ;
 }
 
@@ -160,6 +184,11 @@ static char* parseCommandLine(int argc, char** argv) {
     OPT_DUMP_CONST_STATUS,
     OPT_DUMP_MT_SCHEDULE_JSON,
     OPT_MT_HELPER_MODE,
+    OPT_MT_REPCUT_LITE,
+    OPT_MT_REPCUT_COPY_BUDGET,
+    OPT_MT_REPCUT_FANOUT_BUDGET,
+    OPT_DUMP_MT_REPCUT_LITE_REPORT,
+    OPT_DISABLE_REPLICATION_OPT,
   };
 
   const struct option Table[] = {
@@ -181,6 +210,11 @@ static char* parseCommandLine(int argc, char** argv) {
       {"dump-const-status", no_argument, nullptr, 0},
       {"dump-mt-schedule-json", no_argument, nullptr, 0},
       {"mt-helper-mode", required_argument, nullptr, 0},
+      {"mt-repcut-lite", required_argument, nullptr, 0},
+      {"mt-repcut-copy-budget", required_argument, nullptr, 0},
+      {"mt-repcut-fanout-budget", required_argument, nullptr, 0},
+      {"dump-mt-repcut-lite-report", no_argument, nullptr, 0},
+      {"disable-replication-opt", no_argument, nullptr, 0},
       {nullptr, no_argument, nullptr, 0},
   };
 
@@ -246,13 +280,51 @@ static char* parseCommandLine(int argc, char** argv) {
                   break;
                 case OPT_MT_HELPER_MODE:
                   globalConfig.MtHelperMode = optarg;
-                  if (globalConfig.MtHelperMode != "off" && globalConfig.MtHelperMode != "seq") {
-                    fprintf(stderr, "Error: unknown --mt-helper-mode '%s' (expected off or seq).\n", optarg);
+                  if (globalConfig.MtHelperMode != "off" &&
+                      globalConfig.MtHelperMode != "seq" &&
+                      globalConfig.MtHelperMode != "buffered-seq" &&
+                      globalConfig.MtHelperMode != "mt") {
+                    fprintf(stderr, "Error: unknown --mt-helper-mode '%s' (expected off, seq, buffered-seq, or mt).\n", optarg);
                     printUsage(argv[0]);
                     std::cout.flush();
                     fflush(nullptr);
                     _exit(EXIT_FAILURE);
                   }
+                  break;
+                case OPT_MT_REPCUT_LITE:
+                  globalConfig.MtRepCutLiteMode = optarg;
+                  if (globalConfig.MtRepCutLiteMode != "off" &&
+                      globalConfig.MtRepCutLiteMode != "on") {
+                    fprintf(stderr, "Error: unknown --mt-repcut-lite '%s' (expected off or on).\n", optarg);
+                    printUsage(argv[0]);
+                    std::cout.flush();
+                    fflush(nullptr);
+                    _exit(EXIT_FAILURE);
+                  }
+                  break;
+                case OPT_MT_REPCUT_COPY_BUDGET:
+                  if (!parseNonNegativeInt(optarg, globalConfig.MtRepCutCopyBudget)) {
+                    fprintf(stderr, "Error: invalid --mt-repcut-copy-budget '%s' (expected non-negative integer).\n", optarg);
+                    printUsage(argv[0]);
+                    std::cout.flush();
+                    fflush(nullptr);
+                    _exit(EXIT_FAILURE);
+                  }
+                  break;
+                case OPT_MT_REPCUT_FANOUT_BUDGET:
+                  if (!parseNonNegativeInt(optarg, globalConfig.MtRepCutFanoutBudget)) {
+                    fprintf(stderr, "Error: invalid --mt-repcut-fanout-budget '%s' (expected non-negative integer).\n", optarg);
+                    printUsage(argv[0]);
+                    std::cout.flush();
+                    fflush(nullptr);
+                    _exit(EXIT_FAILURE);
+                  }
+                  break;
+                case OPT_DUMP_MT_REPCUT_LITE_REPORT:
+                  globalConfig.DumpMtRepCutLiteReport = true;
+                  break;
+                case OPT_DISABLE_REPLICATION_OPT:
+                  globalConfig.DisableReplicationOpt = true;
                   break;
                 default: printUsage(argv[0]); std::cout.flush(); fflush(nullptr); _exit(EXIT_SUCCESS);
               }
@@ -354,7 +426,9 @@ int main(int argc, char** argv) {
 
   FUNC_WRAPPER(g->graphPartition(), "graphPartition");
 
-  FUNC_WRAPPER(g->replicationOpt(), "Replication");
+  if (!globalConfig.DisableReplicationOpt) {
+    FUNC_WRAPPER(g->replicationOpt(), "Replication");
+  }
 
   // FUNC_WRAPPER(g->mergeRegister(), "MergeRegister");
 
