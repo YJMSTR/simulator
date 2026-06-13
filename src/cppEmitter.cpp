@@ -2096,6 +2096,7 @@ int graph::genActivateSeqHelpers(bool buffered) {
       SuperNode* super = cppId2Super[idx];
       std::string flagName = prevActiveWhole ? "oldFlag" : (buffered ? format("activeWord%d", id) : format("activeFlags[%d]", id));
       indent = genNodeStepStart(super, mask, idx, flagName, indent);
+      emitBodyLock(indent ++, "{\n");
       if (buffered) {
         emitBodyLock(indent, "ActiveBuffer mtBuffer;\n");
         emitBodyLock(indent, "mtBuffer.clear();\n");
@@ -2112,6 +2113,7 @@ int graph::genActivateSeqHelpers(bool buffered) {
         emitBodyLock(indent, "recordMtProfileTask(%d, %s, mtProfileEnabled ? std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - mtProfileTaskBegin).count() : 0);\n",
                      idx, mtTasks[idx].taskKind == "pure_compute" ? "true" : "false");
       }
+      emitBodyLock(-- indent, "}\n");
       indent = genNodeStepEnd(super, indent);
     }
     emitBodyLock(--indent, "}\n");
@@ -2181,6 +2183,7 @@ int graph::genActivateMtHelpers() {
       SuperNode* super = cppId2Super[idx];
       std::string flagName = prevActiveWhole ? "oldFlag" : format("activeWord%d", id);
       indent = genNodeStepStart(super, mask, idx, flagName, indent);
+      emitBodyLock(indent ++, "{\n");
       emitBodyLock(indent, "ActiveBuffer mtBuffer;\n");
       emitBodyLock(indent, "mtBuffer.clear();\n");
       emitBodyLock(indent, "std::chrono::steady_clock::time_point mtProfileTaskBegin;\n");
@@ -2189,6 +2192,7 @@ int graph::genActivateMtHelpers() {
       emitBodyLock(indent, "recordMtProfileTask(%d, %s, mtProfileEnabled ? std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - mtProfileTaskBegin).count() : 0);\n",
                    idx, mtTasks[idx].taskKind == "pure_compute" ? "true" : "false");
       emitBodyLock(indent, "mtBuffer.mergeFrom(activeFlags);\n");
+      emitBodyLock(-- indent, "}\n");
       indent = genNodeStepEnd(super, indent);
     }
     emitBodyLock(--indent, "}\n");
