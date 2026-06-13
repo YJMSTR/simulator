@@ -1961,9 +1961,8 @@ void graph::genMtTaskRunner(const MtRepCutSemanticPlan& semanticPlan) {
   emitBodyLock(1, "if (taskCount <= 0) return;\n");
   emitBodyLock(1, "std::chrono::steady_clock::time_point mtProfileBatchBegin;\n");
   emitBodyLock(1, "if (mtProfileEnabled) mtProfileBatchBegin = std::chrono::steady_clock::now();\n");
-  emitBodyLock(1, "const char *threadsEnv = getenv(\"GSIM_THREADS\");\n");
-  emitBodyLock(1, "int workerCount = threadsEnv == nullptr ? 1 : atoi(threadsEnv);\n");
-  emitBodyLock(1, "if (workerCount < 1) workerCount = 1;\n");
+  emitBodyLock(1, "int workerCount = mtConfiguredWorkerCount;\n");
+  emitBodyLock(1, "if (taskCount < mtMinBatchTasks) workerCount = 1;\n");
   bool hasForcedSerialBatch = false;
   for (const MtRepCutBatch& batch : semanticPlan.cutBatches) {
     if (batch.forcedSerial) hasForcedSerialBatch = true;
@@ -1983,9 +1982,12 @@ void graph::genMtTaskRunner(const MtRepCutSemanticPlan& semanticPlan) {
   emitBodyLock(1, "if (mtProfileEnabled && workerCount > mtProfileMaxWorkerCount) mtProfileMaxWorkerCount = workerCount;\n");
   emitBodyLock(1, "if (mtProfileEnabled && mtProfileWorkerTaskCount.size() < (size_t)workerCount) mtProfileWorkerTaskCount.resize((size_t)workerCount, 0);\n");
   emitBodyLock(1, "if (mtProfileEnabled) mtProfilePureBatchCount ++;\n");
-  emitBodyLock(1, "std::vector<uint64_t> mtProfileLocalWorkerTaskCount(workerCount, 0);\n");
+  emitBodyLock(1, "std::vector<uint64_t> mtProfileLocalWorkerTaskCount;\n");
   emitBodyLock(1, "std::vector<std::vector<uint64_t>> mtProfileLocalTaskExec;\n");
-  emitBodyLock(1, "if (mtProfileEnabled) mtProfileLocalTaskExec.assign(workerCount, std::vector<uint64_t>(%d, 0));\n", superId);
+  emitBodyLock(1, "if (mtProfileEnabled) {\n");
+  emitBodyLock(2, "mtProfileLocalWorkerTaskCount.assign(workerCount, 0);\n");
+  emitBodyLock(2, "mtProfileLocalTaskExec.assign(workerCount, std::vector<uint64_t>(%d, 0));\n", superId);
+  emitBodyLock(1, "}\n");
   emitBodyLock(1, "std::vector<ActiveBuffer> workerBuffers(workerCount);\n");
   emitBodyLock(1, "for (int worker = 0; worker < workerCount; worker ++) workerBuffers[worker].clear();\n");
   emitBodyLock(1, "std::vector<uint%d_t> workerFlags(workerCount, activeWord);\n", ACTIVE_WIDTH);
@@ -2421,6 +2423,8 @@ void graph::cppEmitter() {
   fprintf(header, "uint%d_t activeFlags[%d];\n", ACTIVE_WIDTH, activeFlagNum); // or super.size() if id == idx
   fprintf(header, "bool mtProfileEnabled;\n");
   fprintf(header, "const char *mtProfileHelperMode;\n");
+  fprintf(header, "int mtConfiguredWorkerCount;\n");
+  fprintf(header, "int mtMinBatchTasks;\n");
   fprintf(header, "int mtProfileConfiguredWorkerCount;\n");
   fprintf(header, "int mtProfileMaxWorkerCount;\n");
   fprintf(header, "uint64_t mtProfileActiveWordCount;\n");
@@ -2514,8 +2518,14 @@ void graph::cppEmitter() {
   emitBodyLock(1, "mtProfileEnabled = profileEnv != nullptr && profileEnv[0] != '\\0' && profileEnv[0] != '0';\n");
   emitBodyLock(1, "mtProfileHelperMode = \"%s\";\n", globalConfig.MtHelperMode.c_str());
   emitBodyLock(1, "const char *threadsEnv = getenv(\"GSIM_THREADS\");\n");
-  emitBodyLock(1, "mtProfileConfiguredWorkerCount = threadsEnv == nullptr ? 1 : atoi(threadsEnv);\n");
-  emitBodyLock(1, "if (mtProfileConfiguredWorkerCount < 1) mtProfileConfiguredWorkerCount = 1;\n");
+  emitBodyLock(1, "mtConfiguredWorkerCount = threadsEnv == nullptr ? 1 : atoi(threadsEnv);\n");
+  emitBodyLock(1, "if (mtConfiguredWorkerCount < 1) mtConfiguredWorkerCount = 1;\n");
+  emitBodyLock(1, "int mtMinBatchTasks = 16;\n");
+  emitBodyLock(1, "const char *minBatchEnv = getenv(\"GSIM_MT_MIN_BATCH_TASKS\");\n");
+  emitBodyLock(1, "if (minBatchEnv != nullptr) mtMinBatchTasks = atoi(minBatchEnv);\n");
+  emitBodyLock(1, "if (mtMinBatchTasks < 1) mtMinBatchTasks = 1;\n");
+  emitBodyLock(1, "this->mtMinBatchTasks = mtMinBatchTasks;\n");
+  emitBodyLock(1, "mtProfileConfiguredWorkerCount = mtConfiguredWorkerCount;\n");
   emitBodyLock(1, "mtProfileMaxWorkerCount = 1;\n");
   emitBodyLock(1, "mtProfileActiveWordCount = 0;\n");
   emitBodyLock(1, "mtProfileSerialTasks = 0;\n");
@@ -2548,7 +2558,7 @@ void graph::cppEmitter() {
 
   emitFuncDecl(0, "void S%s::dumpMtProfile() {\n", name.c_str());
   emitBodyLock(1, "if (!mtProfileEnabled) return;\n");
-  emitBodyLock(1, "fprintf(stderr, \"[mt-profile] helper_mode=%%s worker_count=%%d max_worker_count=%%d cycles=%%lu active_word_count=%%lu serial_tasks=%%lu pure_tasks=%%lu pure_batch_count=%%lu batch_wall_ns=%%lu serial_wall_ns=%%lu merge_wall_ns=%%lu total_step_ns=%%lu\\n\", mtProfileHelperMode, mtProfileConfiguredWorkerCount, mtProfileMaxWorkerCount, cycles, mtProfileActiveWordCount, mtProfileSerialTasks, mtProfilePureTasks, mtProfilePureBatchCount, mtProfileBatchWallNs, mtProfileSerialWallNs, mtProfileMergeWallNs, mtProfileTotalStepNs);\n");
+  emitBodyLock(1, "fprintf(stderr, \"[mt-profile] helper_mode=%%s worker_count=%%d min_batch_tasks=%%d max_worker_count=%%d cycles=%%lu active_word_count=%%lu serial_tasks=%%lu pure_tasks=%%lu pure_batch_count=%%lu batch_wall_ns=%%lu serial_wall_ns=%%lu merge_wall_ns=%%lu total_step_ns=%%lu\\n\", mtProfileHelperMode, mtProfileConfiguredWorkerCount, mtMinBatchTasks, mtProfileMaxWorkerCount, cycles, mtProfileActiveWordCount, mtProfileSerialTasks, mtProfilePureTasks, mtProfilePureBatchCount, mtProfileBatchWallNs, mtProfileSerialWallNs, mtProfileMergeWallNs, mtProfileTotalStepNs);\n");
   emitBodyLock(1, "fprintf(stderr, \"[mt-profile] worker_task_count=\");\n");
   emitBodyLock(1, "for (size_t i = 0; i < mtProfileWorkerTaskCount.size(); i ++) fprintf(stderr, \"%%s%%lu\", i == 0 ? \"\" : \",\", mtProfileWorkerTaskCount[i]);\n");
   emitBodyLock(1, "fprintf(stderr, \"\\n\");\n");
