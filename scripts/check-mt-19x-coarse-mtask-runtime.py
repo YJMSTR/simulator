@@ -198,6 +198,8 @@ def main():
     expect(any(any(task.get("ordering_edges_inside", 0) > 0 for task in region.get("mtasks", []))
                for region in mtask_regions),
            "fixture did not preserve an active/dependency boundary inside a deterministic mtask")
+    expect(any(region.get("active_visibility_edges", 0) > 0 for region in mtask_regions),
+           "fixture did not exercise active-visibility boundaries")
     expect(any(region.get("mtask_count", 0) > 1 for region in mtask_regions),
            "fixture did not keep independent mtask groups separable")
 
