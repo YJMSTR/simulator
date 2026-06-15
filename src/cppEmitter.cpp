@@ -3282,6 +3282,31 @@ void graph::genMtCoarseRegionRunner(const MtRepCutSemanticPlan& semanticPlan, co
   emitBodyLock(1, "}\n");
   emitBodyLock(0, "}\n");
 
+  emitFuncDecl(0, "void S%s::mtMergeLocalCoarseDelta(int worker, int regionBeginActiveWord, int regionActiveWordSpan) {\n", name.c_str());
+  emitBodyLock(1, "if (mtWorkerDeltas[worker].allActive) {\n");
+  emitBodyLock(2, "for (int word = 0; word < regionActiveWordSpan; word ++) mtWorkerCoarseFlags[worker][word] = (uint%d_t)-1;\n", ACTIVE_WIDTH);
+  emitBodyLock(2, "return;\n");
+  emitBodyLock(1, "}\n");
+  emitBodyLock(1, "size_t entryCountBeforeMerge = mtWorkerDeltas[worker].entries.size();\n");
+  emitBodyLock(1, "size_t localEntryCount = 0;\n");
+  emitBodyLock(1, "size_t writeIndex = 0;\n");
+  emitBodyLock(1, "for (size_t readIndex = 0; readIndex < mtWorkerDeltas[worker].entries.size(); readIndex ++) {\n");
+  emitBodyLock(2, "const ActivationDeltaEntry &entry = mtWorkerDeltas[worker].entries[readIndex];\n");
+  emitBodyLock(2, "int localWord = entry.idx - regionBeginActiveWord;\n");
+  emitBodyLock(2, "if (localWord >= 0 && localWord < regionActiveWordSpan) {\n");
+  emitBodyLock(3, "mtWorkerCoarseFlags[worker][localWord] |= (uint%d_t)entry.mask;\n", ACTIVE_WIDTH);
+  emitBodyLock(3, "localEntryCount ++;\n");
+  emitBodyLock(2, "} else {\n");
+  emitBodyLock(3, "mtWorkerDeltas[worker].entries[writeIndex ++] = entry;\n");
+  emitBodyLock(2, "}\n");
+  emitBodyLock(1, "}\n");
+  emitBodyLock(1, "mtWorkerDeltas[worker].entries.resize(writeIndex);\n");
+  emitBodyLock(1, "if (mtProfileEnabled && localEntryCount > 0) {\n");
+  emitBodyLock(2, "mtProfileLocalActivationDeltaEntries[worker] += localEntryCount;\n");
+  emitBodyLock(2, "if (entryCountBeforeMerge > mtProfileLocalActivationDeltaMaxEntries[worker]) mtProfileLocalActivationDeltaMaxEntries[worker] = entryCountBeforeMerge;\n");
+  emitBodyLock(1, "}\n");
+  emitBodyLock(0, "}\n");
+
   emitFuncDecl(0, "void S%s::mtRunCoarseMTaskWorkerRange(int worker, int regionIndex, int mtaskBegin, int mtaskEnd) {\n", name.c_str());
   emitBodyLock(1, "if (mtaskEnd <= mtaskBegin) return;\n");
   emitBodyLock(1, "switch (regionIndex) {\n");
@@ -3313,6 +3338,7 @@ void graph::genMtCoarseRegionRunner(const MtRepCutSemanticPlan& semanticPlan, co
           emitBodyLock(8, "}\n");
           emitBodyLock(7, "}\n");
         }
+        emitBodyLock(7, "mtMergeLocalCoarseDelta(worker, %d, %d);\n", region.beginActiveWord, region.activeWordSpan);
         emitBodyLock(6, "}\n");
       }
       emitBodyLock(6, "break;\n");
@@ -3385,6 +3411,8 @@ void graph::genMtCoarseRegionRunner(const MtRepCutSemanticPlan& semanticPlan, co
   emitBodyLock(2, "mtProfileLocalWorkerTaskCount.assign((size_t)workerCount, 0);\n");
   emitBodyLock(2, "mtProfileLocalTaskIds.clear();\n");
   emitBodyLock(2, "mtProfileLocalTaskIds.resize((size_t)workerCount);\n");
+  emitBodyLock(2, "mtProfileLocalActivationDeltaEntries.assign((size_t)workerCount, 0);\n");
+  emitBodyLock(2, "mtProfileLocalActivationDeltaMaxEntries.assign((size_t)workerCount, 0);\n");
   emitBodyLock(1, "}\n");
   if (globalConfig.MtCoarseRuntimeMode == "mtask") {
     emitBodyLock(1, "int regionMTaskCount = 0;\n");
@@ -3463,8 +3491,11 @@ void graph::genMtCoarseRegionRunner(const MtRepCutSemanticPlan& semanticPlan, co
     emitBodyLock(1, "if (mtProfileEnabled) {\n");
     emitBodyLock(2, "mtProfileCoarseMergeWordScans += (uint64_t)mtaskWorkerCount * (uint64_t)regionActiveWordSpan;\n");
     emitBodyLock(2, "for (int worker = 0; worker < mtaskWorkerCount; worker ++) {\n");
+    emitBodyLock(3, "mtProfileCoarseActivationDeltaEntries += mtProfileLocalActivationDeltaEntries[worker];\n");
+    emitBodyLock(3, "mtProfileActivationDeltaEntries += mtProfileLocalActivationDeltaEntries[worker];\n");
     emitBodyLock(3, "mtProfileCoarseActivationDeltaEntries += mtWorkerDeltas[worker].entries.size();\n");
     emitBodyLock(3, "mtProfileActivationDeltaEntries += mtWorkerDeltas[worker].entries.size();\n");
+    emitBodyLock(3, "if (mtProfileLocalActivationDeltaMaxEntries[worker] > mtProfileActivationDeltaMaxEntriesPerWorker) mtProfileActivationDeltaMaxEntriesPerWorker = mtProfileLocalActivationDeltaMaxEntries[worker];\n");
     emitBodyLock(3, "if (mtWorkerDeltas[worker].entries.size() > mtProfileActivationDeltaMaxEntriesPerWorker) mtProfileActivationDeltaMaxEntriesPerWorker = mtWorkerDeltas[worker].entries.size();\n");
     emitBodyLock(3, "if (mtWorkerDeltas[worker].allActive) mtProfileActivationDeltaActivateAllCount ++;\n");
     emitBodyLock(3, "mtProfileWorkerTaskCount[(size_t)worker] += mtProfileLocalWorkerTaskCount[worker];\n");
@@ -4058,9 +4089,13 @@ void graph::cppEmitter() {
     fprintf(header, "uint64_t mtProfileCoarseRegionLayerCountHist[6];\n");
   }
   fprintf(header, "uint64_t mtProfileTaskExecCount[%d];\n", superId);
-  fprintf(header, "std::vector<uint64_t> mtProfileWorkerTaskCount;\n");
-  fprintf(header, "uint64_t mtProfileBatchSizeHist[6];\n");
-  fprintf(header, "std::vector<uint64_t> mtProfileEffectiveWorkerCountHist;\n");
+    fprintf(header, "std::vector<uint64_t> mtProfileWorkerTaskCount;\n");
+    fprintf(header, "uint64_t mtProfileBatchSizeHist[6];\n");
+    fprintf(header, "std::vector<uint64_t> mtProfileEffectiveWorkerCountHist;\n");
+    if (useCoarseMt) {
+      fprintf(header, "std::vector<uint64_t> mtProfileLocalActivationDeltaEntries;\n");
+      fprintf(header, "std::vector<uint64_t> mtProfileLocalActivationDeltaMaxEntries;\n");
+    }
   if (useMtHelpers) {
     fprintf(header, "std::vector<ActivationDelta> mtWorkerDeltas;\n");
     fprintf(header, "std::vector<uint%d_t> mtWorkerFlags;\n", ACTIVE_WIDTH);
@@ -4351,6 +4386,7 @@ void graph::cppEmitter() {
       fprintf(header, "void mtRunPureBatch(int beginCppId, int endCppId, uint%d_t &activeWord);\n", ACTIVE_WIDTH);
       if (useCoarseMt) {
         fprintf(header, "void mtRunCoarseLayerWorkerRange(int worker, int regionIndex, int layerIndex, int chunkBegin, int chunkEnd);\n");
+        fprintf(header, "void mtMergeLocalCoarseDelta(int worker, int regionBeginActiveWord, int regionActiveWordSpan);\n");
         fprintf(header, "void mtRunCoarseMTaskWorkerRange(int worker, int regionIndex, int mtaskBegin, int mtaskEnd);\n");
         fprintf(header, "void mtRunCoarseRegion(int regionIndex, uint%d_t *coarseActiveWords);\n", ACTIVE_WIDTH);
       }

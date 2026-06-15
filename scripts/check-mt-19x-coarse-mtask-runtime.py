@@ -184,6 +184,7 @@ def main():
     mtask_text = generated_text(models["mtask"])
     for token in (
         "mtRunCoarseMTaskWorkerRange",
+        "mtMergeLocalCoarseDelta",
         "mtProfileCoarseMTaskDispatches",
         "coarse_runtime=%s",
     ):
@@ -226,6 +227,10 @@ def main():
            "mtask runtime did not reduce coarse flag word copies")
     expect(profile_int(mtask_profile, "merge_word_scans") < profile_int(layered_profile, "merge_word_scans"),
            "mtask runtime did not reduce merge word scans")
+    expect(profile_int(mtask_profile, "activation_delta_entries") > 0,
+           "mtask runtime lost ActivationDelta entry accounting during local merges")
+    expect(profile_int(mtask_profile, "activation_delta_entries") == profile_int(layered_profile, "activation_delta_entries"),
+           "mtask runtime changed ActivationDelta entry accounting relative to layered runtime")
     print("mt-19x-coarse-mtask-runtime ok: "
           f"layered_barriers={layered_profile['estimated_barriers']} "
           f"mtask_barriers={mtask_profile['estimated_barriers']} "
