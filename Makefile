@@ -201,7 +201,7 @@ FIR_TEST_OUTPUT_DIR ?= $(BUILD_DIR)/fir-tests
 FIR_TEST_CASES ?= $(basename $(notdir $(wildcard $(FIR_TEST_INPUT_DIR)/*.fir)))
 FIR_TEST_TIMEOUT ?=
 FIR_TEST ?=
-MT_FIR_SMOKE_CASES ?= mt-comb mt-reg-reset mt-async-reset mt-memory mt-multiclock
+MT_FIR_SMOKE_CASES ?= mt-comb mt-reg-reset mt-async-reset mt-memory mt-multiclock mt-orword-packed
 MT_FIR_SMOKE_GSIM_FLAGS ?= --supernode-max-size=1
 FIR_TEST_TIMEOUT_PREFIX = $(if $(strip $(FIR_TEST_TIMEOUT)),timeout $(FIR_TEST_TIMEOUT),)
 FIR_TEST_TARGETS = $(addprefix $(FIR_TEST_OUTPUT_DIR)/,$(addsuffix /.done,$(FIR_TEST_CASES)))

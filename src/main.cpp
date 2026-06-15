@@ -43,15 +43,18 @@ Config::Config() {
   DumpConstStatus = false;
   DumpMtScheduleJson = false;
   DumpMtRepCutLiteReport = false;
+  DumpMtCoarseRegionReport = false;
   DisableReplicationOpt = false;
   MtHelperMode = "off";
   MtRepCutLiteMode = "off";
+  MtBatchFormationMode = "legacy";
   OutputDir = ".";
   InputBaseName = "";
   SuperNodeMaxSize = 35;
   cppMaxSizeKB = -1;
   MtRepCutCopyBudget = 0;
   MtRepCutFanoutBudget = 0;
+  MtActiveFrequencyCostThreshold = 2;
   sep_module = "$";
   sep_aggr = "$$";
   MergeWhenSize = 5;
@@ -152,7 +155,13 @@ static void printUsage(const char* ProgName) {
             << "      --mt-repcut-lite=off|on       Enable bounded RepCut-lite candidate selection; off is the default.\n"
             << "      --mt-repcut-copy-budget=N     Total RepCut-lite copy cost budget; default 0.\n"
             << "      --mt-repcut-fanout-budget=N   Per-candidate RepCut-lite fanout budget; default 0.\n"
+            << "      --mt-batch-formation=legacy|active-frequency|coarse\n"
+            << "                                      Select pure batch formation mode; legacy is default.\n"
+            << "      --mt-active-frequency-cost-threshold=N\n"
+            << "                                      Minimum estimated released static cost for active-frequency batches; default 2.\n"
             << "      --dump-mt-repcut-lite-report  Write a deterministic RepCut-lite candidate report JSON.\n"
+            << "      --dump-mt-coarse-region-report\n"
+            << "                                      Write a deterministic coarse-region report JSON.\n"
             << "      --disable-replication-opt     Skip the existing gsim replicationOpt pass.\n"
             ;
 }
@@ -187,7 +196,10 @@ static char* parseCommandLine(int argc, char** argv) {
     OPT_MT_REPCUT_LITE,
     OPT_MT_REPCUT_COPY_BUDGET,
     OPT_MT_REPCUT_FANOUT_BUDGET,
+    OPT_MT_BATCH_FORMATION,
+    OPT_MT_ACTIVE_FREQUENCY_COST_THRESHOLD,
     OPT_DUMP_MT_REPCUT_LITE_REPORT,
+    OPT_DUMP_MT_COARSE_REGION_REPORT,
     OPT_DISABLE_REPLICATION_OPT,
   };
 
@@ -213,7 +225,10 @@ static char* parseCommandLine(int argc, char** argv) {
       {"mt-repcut-lite", required_argument, nullptr, 0},
       {"mt-repcut-copy-budget", required_argument, nullptr, 0},
       {"mt-repcut-fanout-budget", required_argument, nullptr, 0},
+      {"mt-batch-formation", required_argument, nullptr, 0},
+      {"mt-active-frequency-cost-threshold", required_argument, nullptr, 0},
       {"dump-mt-repcut-lite-report", no_argument, nullptr, 0},
+      {"dump-mt-coarse-region-report", no_argument, nullptr, 0},
       {"disable-replication-opt", no_argument, nullptr, 0},
       {nullptr, no_argument, nullptr, 0},
   };
@@ -320,8 +335,32 @@ static char* parseCommandLine(int argc, char** argv) {
                     _exit(EXIT_FAILURE);
                   }
                   break;
+                case OPT_MT_BATCH_FORMATION:
+                  globalConfig.MtBatchFormationMode = optarg;
+                  if (globalConfig.MtBatchFormationMode != "legacy" &&
+                      globalConfig.MtBatchFormationMode != "active-frequency" &&
+                      globalConfig.MtBatchFormationMode != "coarse") {
+                    fprintf(stderr, "Error: unknown --mt-batch-formation '%s' (expected legacy, active-frequency, or coarse).\n", optarg);
+                    printUsage(argv[0]);
+                    std::cout.flush();
+                    fflush(nullptr);
+                    _exit(EXIT_FAILURE);
+                  }
+                  break;
+                case OPT_MT_ACTIVE_FREQUENCY_COST_THRESHOLD:
+                  if (!parseNonNegativeInt(optarg, globalConfig.MtActiveFrequencyCostThreshold)) {
+                    fprintf(stderr, "Error: invalid --mt-active-frequency-cost-threshold '%s' (expected non-negative integer).\n", optarg);
+                    printUsage(argv[0]);
+                    std::cout.flush();
+                    fflush(nullptr);
+                    _exit(EXIT_FAILURE);
+                  }
+                  break;
                 case OPT_DUMP_MT_REPCUT_LITE_REPORT:
                   globalConfig.DumpMtRepCutLiteReport = true;
+                  break;
+                case OPT_DUMP_MT_COARSE_REGION_REPORT:
+                  globalConfig.DumpMtCoarseRegionReport = true;
                   break;
                 case OPT_DISABLE_REPLICATION_OPT:
                   globalConfig.DisableReplicationOpt = true;

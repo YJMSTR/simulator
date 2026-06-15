@@ -175,13 +175,13 @@ def build_and_run_trace(model_dir, work_dir, label):
 
 def check_mt_structure(model_dir, case):
     text = "\n".join(path.read_text() for path in sorted(model_dir.glob("*.h")) + sorted(model_dir.glob("*.cpp")))
-    for token in ("#include <thread>", "ActiveBuffer", "mtRunPureBatch", "std::thread"):
+    for token in ("#include <thread>", "ActivationDelta", "mtRunPureBatch", "std::thread"):
         expect(token in text, f"mt generated sources missing {token}")
     batch_call_count = text.count("mtRunPureBatch(") - 1
     if case == "mt-comb":
         expect(batch_call_count >= 1, "mt-comb must dispatch at least one pure batch")
-    task_bodies = re.findall(r"\bvoid\s+\w+::(mtTask\d+)\s*\([^)]*ActiveBuffer[^)]*\)\s*\{(.*?)\n\}", text, re.S)
-    expect(task_bodies, "mt generated sources have no buffered mtTask helpers")
+    task_bodies = re.findall(r"\bvoid\s+\w+::(mtTask\d+)\s*\([^)]*ActivationDelta[^)]*\)\s*\{(.*?)\n\}", text, re.S)
+    expect(task_bodies, "mt generated sources have no delta mtTask helpers")
     for task, body in task_bodies:
         expect("activeFlags[" not in body, f"{task} touches global activeFlags directly")
         expect("activateAll()" not in body, f"{task} calls activateAll directly")

@@ -9,15 +9,18 @@ struct Config {
   bool DumpConstStatus;
   bool DumpMtScheduleJson;
   bool DumpMtRepCutLiteReport;
+  bool DumpMtCoarseRegionReport;
   bool DisableReplicationOpt;
   std::string MtHelperMode;
   std::string MtRepCutLiteMode;
+  std::string MtBatchFormationMode;
   std::string OutputDir;
   std::string InputBaseName;
   int SuperNodeMaxSize;
   uint32_t cppMaxSizeKB;
   int MtRepCutCopyBudget;
   int MtRepCutFanoutBudget;
+  int MtActiveFrequencyCostThreshold;
   std::string sep_module;
   std::string sep_aggr;
   int MergeWhenSize;

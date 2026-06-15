@@ -20,6 +20,7 @@
 
 #define ACTIVE_WIDTH 8
 #define RESET_PER_FUNC 400
+#define MT_PURE_BATCH_SHARD_SIZE 256
 
 #define ENABLE_ACTIVATOR false
 
@@ -63,7 +64,12 @@ static bool hasCppId(const std::set<SuperNode*>& supers, int cppId) {
 struct MtBoundaryInfo {
   std::map<std::string, int> nodeKinds;
   std::set<std::string> clockNames;
+  std::set<std::string> stateTargetNames;
+  std::set<std::string> rhsReadStateTargetNames;
   bool hasStateUpdate = false;
+  bool hasAmbiguousStateTarget = false;
+  bool hasRhsNextStateObjectRead = false;
+  bool hasUnexpandedRhsDependency = false;
   bool hasMemoryWrite = false;
   bool hasMemoryRead = false;
   bool hasReset = false;
@@ -74,6 +80,9 @@ struct MtBoundaryInfo {
   bool hasUnknownNode = false;
   bool hasUnknownOp = false;
   bool hasArrayOrDynamicIndex = false;
+  int stateSourceCommitCount = 0;
+  int stateNextUpdateCount = 0;
+  int stateResetUpdateCount = 0;
 };
 
 struct MtTaskInfo {
@@ -106,6 +115,38 @@ struct MtPureBatchPlan {
   std::vector<std::pair<int, int>> batches;
   std::vector<MtRepCutEdge> cutEdges;
   int segmentCount = 0;
+};
+
+struct MtCoarseLayer {
+  std::vector<int> taskCppIds;
+};
+
+struct MtCoarseRegion {
+  int beginCppId = -1;
+  int endCppId = -1;
+  int beginActiveWord = -1;
+  int endActiveWord = -1;
+  int taskCount = 0;
+  int activeWordSpan = 0;
+  int staticCost = 0;
+  int memberNodeCost = 0;
+  int expectedActiveCost = 0;
+  int pureTaskCount = 0;
+  int serialBlockerCount = 0;
+  int dependencyEdgeCount = 0;
+  int activeVisibilityEdgeCount = 0;
+  int sameCycleActivationHazardCount = 0;
+  int replicationCandidateCount = 0;
+  int estimatedLayerCount = 0;
+  int estimatedMaxParallelWidth = 0;
+  bool runtimeEligible = false;
+  bool repcutLiteCouldHelp = false;
+  std::vector<std::string> blockers;
+  std::vector<MtCoarseLayer> layers;
+};
+
+struct MtCoarseRegionPlan {
+  std::vector<MtCoarseRegion> regions;
 };
 
 struct MtRepCutClone {
@@ -224,6 +265,17 @@ static void dumpJsonIntArray(FILE* fp, const std::set<int>& values) {
   fprintf(fp, "]");
 }
 
+static void dumpJsonIntArray(FILE* fp, const std::vector<int>& values) {
+  fprintf(fp, "[");
+  bool first = true;
+  for (int value : values) {
+    if (!first) fprintf(fp, ", ");
+    first = false;
+    fprintf(fp, "%d", value);
+  }
+  fprintf(fp, "]");
+}
+
 static void dumpJsonStringArray(FILE* fp, const std::set<std::string>& values) {
   fprintf(fp, "[");
   bool first = true;
@@ -257,6 +309,88 @@ static void addCppIdsIfExecutable(std::set<int>& ids, const std::set<SuperNode*>
 static bool nodeHasStateUpdate(Node* node) {
   return node->type == NODE_REG_DST || node->type == NODE_REG_RESET ||
          (node->type == NODE_REG_SRC && node->regNext && node->regNext->status == VALID_NODE);
+}
+
+static bool stateTargetNameForNode(Node* node, std::string& targetName) {
+  if (!node) return false;
+  Node* target = nullptr;
+  if (node->type == NODE_REG_SRC) {
+    if (!node->regNext || node->regNext->status != VALID_NODE) return false;
+    target = node;
+  } else if (node->type == NODE_REG_DST) {
+    if (!node->regNext) return false;
+    target = node->getSrc();
+  } else if (node->type == NODE_REG_RESET) {
+    if (!node->regNext) return false;
+    target = node->getResetSrc();
+  } else {
+    return false;
+  }
+  if (!target || target->name.empty()) return false;
+  targetName = target->name;
+  return true;
+}
+
+static void collectStateTargetName(Node* node, MtBoundaryInfo& info) {
+  if (!nodeHasStateUpdate(node)) return;
+  if (node->type == NODE_REG_SRC) info.stateSourceCommitCount ++;
+  else if (node->type == NODE_REG_DST) info.stateNextUpdateCount ++;
+  else if (node->type == NODE_REG_RESET) info.stateResetUpdateCount ++;
+  std::string targetName;
+  if (stateTargetNameForNode(node, targetName)) {
+    info.stateTargetNames.insert(targetName);
+  } else {
+    info.hasAmbiguousStateTarget = true;
+  }
+}
+
+static const size_t MT_RHS_STATE_READ_ENODE_LIMIT = 128;
+static const size_t MT_RHS_STATE_READ_EXPAND_NODE_LIMIT = 32;
+
+static void collectMtRhsStateReads(ENode* root,
+                                   MtBoundaryInfo& info,
+                                   Node* owner,
+                                   std::set<ENode*>& visitedENodes,
+                                   std::set<Node*>& expandedNodes) {
+  if (!root) return;
+  std::stack<ENode*> stack;
+  stack.push(root);
+  while (!stack.empty()) {
+    ENode* top = stack.top();
+    stack.pop();
+    if (!top) continue;
+    if (visitedENodes.find(top) != visitedENodes.end()) continue;
+    if (visitedENodes.size() >= MT_RHS_STATE_READ_ENODE_LIMIT) {
+      info.hasUnexpandedRhsDependency = true;
+      return;
+    }
+    visitedENodes.insert(top);
+    if (top->nodePtr) {
+      if (top->nodePtr->type == NODE_REG_SRC) {
+        info.rhsReadStateTargetNames.insert(top->nodePtr->name);
+      } else if (top->nodePtr->type == NODE_REG_DST || top->nodePtr->type == NODE_REG_RESET) {
+        bool expectedCommitRead = owner && owner->type == NODE_REG_SRC &&
+                                  top->nodePtr->type == NODE_REG_DST &&
+                                  owner->getDst() == top->nodePtr;
+        if (!expectedCommitRead) info.hasRhsNextStateObjectRead = true;
+      } else if (!top->nodePtr->assignTree.empty() &&
+                 expandedNodes.find(top->nodePtr) == expandedNodes.end()) {
+        if (expandedNodes.size() >= MT_RHS_STATE_READ_EXPAND_NODE_LIMIT) {
+          info.hasUnexpandedRhsDependency = true;
+          continue;
+        }
+        expandedNodes.insert(top->nodePtr);
+        // Bounded expansion preserves small local proofs without recursively
+        // exploding through large XiangShan combinational cones.
+        for (ExpTree* tree : top->nodePtr->assignTree) {
+          collectMtRhsStateReads(tree->getRoot(), info, owner, visitedENodes, expandedNodes);
+        }
+      }
+    }
+    for (ENode* child : top->child) {
+      if (child) stack.push(child);
+    }
+  }
 }
 
 static bool nodeHasMemoryWrite(Node* node) {
@@ -387,6 +521,7 @@ static MtBoundaryInfo collectMtBoundaryInfo(SuperNode* super, int& candidateCost
   for (Node* member : super->member) {
     info.nodeKinds[nodeTypeName(member->type)] ++;
     info.hasStateUpdate = info.hasStateUpdate || nodeHasStateUpdate(member);
+    collectStateTargetName(member, info);
     info.hasMemoryWrite = info.hasMemoryWrite || nodeHasMemoryWrite(member);
     info.hasMemoryRead = info.hasMemoryRead || nodeHasMemoryRead(member);
     info.hasReset = info.hasReset || member->isReset() || member->type == NODE_REG_RESET;
@@ -401,6 +536,11 @@ static MtBoundaryInfo collectMtBoundaryInfo(SuperNode* super, int& candidateCost
     for (ExpTree* tree : member->assignTree) {
       visitMtENode(tree->getRoot(), info, candidateCost);
       visitMtENode(tree->getlval(), info, candidateCost);
+      if (nodeHasStateUpdate(member)) {
+        std::set<ENode*> visitedENodes;
+        std::set<Node*> expandedNodes;
+        collectMtRhsStateReads(tree->getRoot(), info, member, visitedENodes, expandedNodes);
+      }
     }
     if (member->resetTree) {
       visitMtENode(member->resetTree->getRoot(), info, candidateCost);
@@ -541,6 +681,21 @@ static bool mtCanCutEdge(const std::map<int, MtTaskInfo>& tasks, int fromCppId, 
   return mtTasksHaveDirectedEdge(cppId2Super[fromCppId], cppId2Super[toCppId]);
 }
 
+static bool mtTaskHasSameActiveWordHazard(const std::map<int, MtTaskInfo>& tasks, int cppId, bool allowCuts) {
+  if (!mtTaskCanEnterPureBatch(tasks, cppId)) return false;
+  int wordBegin = (cppId / ACTIVE_WIDTH) * ACTIVE_WIDTH;
+  int wordEnd = std::min(superId, wordBegin + ACTIVE_WIDTH);
+  for (int otherCppId = wordBegin; otherCppId < wordEnd; otherCppId ++) {
+    if (otherCppId == cppId) continue;
+    if (!mtTaskCanEnterPureBatch(tasks, otherCppId)) continue;
+    if (!mtTasksHaveEdge(cppId2Super[cppId], cppId2Super[otherCppId])) continue;
+    bool cutForward = allowCuts && mtCanCutEdge(tasks, cppId, otherCppId);
+    bool cutBackward = allowCuts && mtCanCutEdge(tasks, otherCppId, cppId);
+    if (!cutForward && !cutBackward) return true;
+  }
+  return false;
+}
+
 static bool mtTaskCanJoinPureBatchWithCuts(const std::map<int, MtTaskInfo>& tasks,
                                            const std::vector<int>& batch,
                                            int cppId,
@@ -560,16 +715,221 @@ static bool mtTaskCanJoinPureBatchWithCuts(const std::map<int, MtTaskInfo>& task
   return true;
 }
 
-static MtPureBatchPlan planMtPureBatches(const std::map<int, MtTaskInfo>& tasks, bool allowCuts) {
+static int mtTaskEstimatedCost(const std::map<int, MtTaskInfo>& tasks, int cppId) {
+  auto iter = tasks.find(cppId);
+  if (iter == tasks.end()) return 1;
+  if (iter->second.hasCandidateCost && iter->second.candidateCost > 0) return iter->second.candidateCost;
+  return 1;
+}
+
+static int mtBatchEstimatedCost(const std::map<int, MtTaskInfo>& tasks, int beginCppId, int endCppId) {
+  int cost = 0;
+  for (int cppId = beginCppId; cppId < endCppId; cppId ++) {
+    cost += mtTaskEstimatedCost(tasks, cppId);
+  }
+  return cost;
+}
+
+static int mtBatchMemberNodeCost(int beginCppId, int endCppId) {
+  int cost = 0;
+  for (int cppId = beginCppId; cppId < endCppId; cppId ++) {
+    auto iter = cppId2Super.find(cppId);
+    if (iter != cppId2Super.end() && iter->second) cost += static_cast<int>(iter->second->member.size());
+  }
+  return cost;
+}
+
+static bool mtActiveWordIsWhole(int beginCppId) {
+  for (int j = 0; j < ACTIVE_WIDTH && beginCppId + j < superId; j ++) {
+    if (isAlwaysActive(beginCppId + j)) return false;
+  }
+  return true;
+}
+
+static int mtPureBatchShardCount() {
+  return (superId + MT_PURE_BATCH_SHARD_SIZE - 1) / MT_PURE_BATCH_SHARD_SIZE;
+}
+
+static void mtAddCoarseBlocker(MtCoarseRegion& region, const std::string& blocker) {
+  if (std::find(region.blockers.begin(), region.blockers.end(), blocker) == region.blockers.end()) {
+    region.blockers.push_back(blocker);
+  }
+}
+
+static bool mtTaskHasActiveEdgeTo(int fromCppId, int toCppId) {
+  auto iter = cppId2Super.find(fromCppId);
+  if (iter == cppId2Super.end() || !iter->second) return false;
+  for (Node* member : iter->second->member) {
+    if (member && member->nextActiveId.find(toCppId) != member->nextActiveId.end()) return true;
+  }
+  return false;
+}
+
+static bool mtTaskHasDependencyEdgeTo(int fromCppId, int toCppId) {
+  auto from = cppId2Super.find(fromCppId);
+  auto to = cppId2Super.find(toCppId);
+  if (from == cppId2Super.end() || to == cppId2Super.end() || !from->second || !to->second) return false;
+  if (hasCppId(from->second->next, toCppId) || hasCppId(from->second->depNext, toCppId) ||
+      hasCppId(to->second->prev, fromCppId) || hasCppId(to->second->depPrev, fromCppId)) {
+    return true;
+  }
+  return false;
+}
+
+static bool mtTaskHasOrderingEdgeTo(int fromCppId, int toCppId) {
+  return mtTaskHasDependencyEdgeTo(fromCppId, toCppId) || mtTaskHasActiveEdgeTo(fromCppId, toCppId);
+}
+
+static void mtAddCoarseLayers(MtCoarseRegion& region) {
+  int n = region.endCppId - region.beginCppId;
+  if (n <= 0) return;
+  std::vector<int> indegree(n, 0);
+  std::vector<std::vector<int>> edges(n);
+  for (int from = region.beginCppId; from < region.endCppId; from ++) {
+    for (int to = region.beginCppId; to < region.endCppId; to ++) {
+      if (from == to) continue;
+      if (!mtTaskHasOrderingEdgeTo(from, to)) continue;
+      int fromIndex = from - region.beginCppId;
+      int toIndex = to - region.beginCppId;
+      edges[fromIndex].push_back(toIndex);
+      indegree[toIndex] ++;
+    }
+  }
+
+  std::vector<bool> emitted(n, false);
+  int emittedCount = 0;
+  while (emittedCount < n) {
+    MtCoarseLayer layer;
+    for (int i = 0; i < n; i ++) {
+      if (!emitted[i] && indegree[i] == 0) layer.taskCppIds.push_back(region.beginCppId + i);
+    }
+    if (layer.taskCppIds.empty()) {
+      mtAddCoarseBlocker(region, "data_dependency");
+      mtAddCoarseBlocker(region, "codegen_runtime_limit");
+      region.layers.clear();
+      region.runtimeEligible = false;
+      region.estimatedLayerCount = 0;
+      region.estimatedMaxParallelWidth = 0;
+      return;
+    }
+    for (int cppId : layer.taskCppIds) {
+      int index = cppId - region.beginCppId;
+      if (emitted[index]) continue;
+      emitted[index] = true;
+      emittedCount ++;
+      for (int toIndex : edges[index]) indegree[toIndex] --;
+    }
+    region.estimatedMaxParallelWidth = std::max(region.estimatedMaxParallelWidth, static_cast<int>(layer.taskCppIds.size()));
+    region.layers.push_back(layer);
+  }
+  region.estimatedLayerCount = static_cast<int>(region.layers.size());
+}
+
+static MtCoarseRegion mtBuildCoarseRegion(const std::map<int, MtTaskInfo>& tasks, int beginCppId, int endCppId) {
+  MtCoarseRegion region;
+  region.beginCppId = beginCppId;
+  region.endCppId = endCppId;
+  region.beginActiveWord = beginCppId / ACTIVE_WIDTH;
+  region.endActiveWord = (endCppId - 1) / ACTIVE_WIDTH + 1;
+  region.taskCount = endCppId - beginCppId;
+  region.activeWordSpan = region.endActiveWord - region.beginActiveWord;
+  region.staticCost = mtBatchEstimatedCost(tasks, beginCppId, endCppId);
+  region.memberNodeCost = mtBatchMemberNodeCost(beginCppId, endCppId);
+  region.expectedActiveCost = region.staticCost;
+  region.pureTaskCount = region.taskCount;
+
+  for (int cppId = beginCppId; cppId < endCppId; cppId ++) {
+    auto iter = tasks.find(cppId);
+    if (iter == tasks.end() || iter->second.taskKind != "pure_compute") {
+      region.pureTaskCount --;
+      region.serialBlockerCount ++;
+      mtAddCoarseBlocker(region, "serial_task");
+      continue;
+    }
+    if (isAlwaysActive(cppId)) mtAddCoarseBlocker(region, "codegen_runtime_limit");
+  }
+
+  for (int from = beginCppId; from < endCppId; from ++) {
+    for (int to = beginCppId; to < endCppId; to ++) {
+      if (from == to) continue;
+      if (mtTaskHasDependencyEdgeTo(from, to)) {
+        region.dependencyEdgeCount ++;
+        if (from > to) mtAddCoarseBlocker(region, "data_dependency");
+      }
+      if (mtTaskHasActiveEdgeTo(from, to)) {
+        region.activeVisibilityEdgeCount ++;
+        if (to > from) region.sameCycleActivationHazardCount ++;
+        if (from > to) mtAddCoarseBlocker(region, "active_visibility_edge");
+      }
+      if (mtCanCutEdge(tasks, from, to)) {
+        region.replicationCandidateCount ++;
+        region.repcutLiteCouldHelp = true;
+      }
+    }
+  }
+
+  if (beginCppId % ACTIVE_WIDTH != 0 || endCppId % ACTIVE_WIDTH != 0) {
+    mtAddCoarseBlocker(region, "codegen_runtime_limit");
+  }
+  if (region.taskCount < globalConfig.MtActiveFrequencyCostThreshold) {
+    mtAddCoarseBlocker(region, "codegen_runtime_limit");
+  }
+  if (region.activeWordSpan <= 1) {
+    mtAddCoarseBlocker(region, "codegen_runtime_limit");
+  }
+  if (region.pureTaskCount != region.taskCount) {
+    mtAddCoarseBlocker(region, "serial_task");
+  }
+
+  region.runtimeEligible = region.blockers.empty();
+  mtAddCoarseLayers(region);
+  if (region.layers.empty()) {
+    region.runtimeEligible = false;
+  }
+  if (region.estimatedMaxParallelWidth < 2) {
+    mtAddCoarseBlocker(region, "codegen_runtime_limit");
+    region.runtimeEligible = false;
+  }
+  return region;
+}
+
+static MtCoarseRegionPlan planMtCoarseRegions(const std::map<int, MtTaskInfo>& tasks) {
+  MtCoarseRegionPlan plan;
+  for (int beginWord = 0; beginWord * ACTIVE_WIDTH < superId; beginWord ++) {
+    int beginCppId = beginWord * ACTIVE_WIDTH;
+    if (!mtActiveWordIsWhole(beginCppId)) continue;
+    int endWord = beginWord;
+    while (endWord * ACTIVE_WIDTH < superId) {
+      int wordBegin = endWord * ACTIVE_WIDTH;
+      if (!mtActiveWordIsWhole(wordBegin)) break;
+      int wordEnd = std::min(superId, wordBegin + ACTIVE_WIDTH);
+      bool wholeWordPure = wordEnd - wordBegin == ACTIVE_WIDTH;
+      for (int cppId = wordBegin; cppId < wordEnd; cppId ++) {
+        if (!mtTaskCanEnterPureBatch(tasks, cppId)) {
+          wholeWordPure = false;
+          break;
+        }
+      }
+      if (!wholeWordPure) break;
+      endWord ++;
+    }
+    int endCppId = endWord * ACTIVE_WIDTH;
+    if (endCppId - beginCppId >= ACTIVE_WIDTH) {
+      MtCoarseRegion region = mtBuildCoarseRegion(tasks, beginCppId, endCppId);
+      plan.regions.push_back(region);
+      beginWord = std::max(beginWord, endWord - 1);
+    }
+  }
+  return plan;
+}
+
+static MtPureBatchPlan planMtPureBatchesLegacy(const std::map<int, MtTaskInfo>& tasks, bool allowCuts) {
   MtPureBatchPlan plan;
   for (int idx = 0; idx < superId; idx ++) {
     int id;
     uint64_t mask;
     std::tie(id, mask) = setIdxMask(idx);
-    bool activeWhole = true;
-    for (int j = 0; j < ACTIVE_WIDTH && idx + j < superId; j ++) {
-      if (isAlwaysActive(idx + j)) activeWhole = false;
-    }
+    bool activeWhole = mtActiveWordIsWhole(idx);
     if (!activeWhole || !mtTaskCanEnterPureBatch(tasks, idx)) continue;
     plan.segmentCount ++;
 
@@ -589,6 +949,46 @@ static MtPureBatchPlan planMtPureBatches(const std::map<int, MtTaskInfo>& tasks,
     }
   }
   return plan;
+}
+
+static MtPureBatchPlan planMtPureBatchesActiveFrequency(const std::map<int, MtTaskInfo>& tasks, bool allowCuts) {
+  MtPureBatchPlan plan;
+  int threshold = globalConfig.MtActiveFrequencyCostThreshold;
+  for (int wordBegin = 0; wordBegin < superId; wordBegin += ACTIVE_WIDTH) {
+    if (!mtActiveWordIsWhole(wordBegin)) continue;
+    int wordEnd = std::min(superId, wordBegin + ACTIVE_WIDTH);
+    int idx = wordBegin;
+    while (idx < wordEnd) {
+      while (idx < wordEnd && !mtTaskCanEnterPureBatch(tasks, idx)) idx ++;
+      if (idx >= wordEnd) break;
+      plan.segmentCount ++;
+
+      std::vector<int> batch;
+      std::vector<MtRepCutEdge> batchCutEdges;
+      int batchBegin = idx;
+      int batchEnd = idx;
+      while (batchEnd < wordEnd &&
+             mtTaskCanJoinPureBatchWithCuts(tasks, batch, batchEnd, allowCuts, &batchCutEdges)) {
+        batch.push_back(batchEnd);
+        batchEnd ++;
+      }
+      if (batchEnd - batchBegin > 1 &&
+          mtBatchEstimatedCost(tasks, batchBegin, batchEnd) >= threshold) {
+        plan.batches.push_back(std::make_pair(batchBegin, batchEnd));
+        plan.cutEdges.insert(plan.cutEdges.end(), batchCutEdges.begin(), batchCutEdges.end());
+      }
+      idx = std::max(batchEnd, batchBegin + 1);
+    }
+  }
+  return plan;
+}
+
+static MtPureBatchPlan planMtPureBatches(const std::map<int, MtTaskInfo>& tasks, bool allowCuts) {
+  if (globalConfig.MtBatchFormationMode == "active-frequency" ||
+      globalConfig.MtBatchFormationMode == "coarse") {
+    return planMtPureBatchesActiveFrequency(tasks, allowCuts);
+  }
+  return planMtPureBatchesLegacy(tasks, allowCuts);
 }
 
 static std::string mtRepCutIntLiteral(ENode* enode) {
@@ -961,6 +1361,199 @@ static std::string repcutBlockReasonForTask(const MtTaskInfo& task) {
   return "";
 }
 
+static bool mtStateUpdateHasMemoryOrDynamicArray(const MtBoundaryInfo& boundary) {
+  return boundary.hasMemoryWrite || boundary.hasMemoryRead || boundary.hasArrayOrDynamicIndex;
+}
+
+static bool mtStateUpdateHasExternalOrSpecial(const MtBoundaryInfo& boundary) {
+  return boundary.hasExternal || boundary.hasSpecial || boundary.hasUnknownNode || boundary.hasUnknownOp;
+}
+
+static bool mtStateUpdateHasSameCycleTargetRead(const MtBoundaryInfo& boundary,
+                                                const std::set<std::string>& allStateTargetNames) {
+  if (boundary.hasRhsNextStateObjectRead) return true;
+  for (const std::string& name : boundary.rhsReadStateTargetNames) {
+    if (boundary.stateTargetNames.find(name) != boundary.stateTargetNames.end()) return true;
+    if (allStateTargetNames.find(name) != allStateTargetNames.end()) return true;
+  }
+  return false;
+}
+
+static bool mtStateUpdateCanClassifyRhsTiming(const MtBoundaryInfo& boundary) {
+  if (!boundary.hasStateUpdate) return false;
+  if (boundary.hasAmbiguousStateTarget || boundary.stateTargetNames.size() != 1) return false;
+  if (boundary.hasReset || boundary.hasAsyncReset || boundary.hasActivateAllPath) return false;
+  if (mtStateUpdateHasMemoryOrDynamicArray(boundary)) return false;
+  if (mtStateUpdateHasExternalOrSpecial(boundary)) return false;
+  if (boundary.hasRhsNextStateObjectRead) return false;
+  if (boundary.hasUnexpandedRhsDependency) return false;
+  return true;
+}
+
+static std::string mtStateUpdateRhsTimingClass(const MtBoundaryInfo& boundary) {
+  if (!mtStateUpdateCanClassifyRhsTiming(boundary)) return "unknown";
+  if (boundary.stateSourceCommitCount == 1 && boundary.stateNextUpdateCount == 0 && boundary.stateResetUpdateCount == 0) {
+    return "precomputed";
+  }
+  if (boundary.stateSourceCommitCount == 0 && boundary.stateNextUpdateCount == 1 && boundary.stateResetUpdateCount == 0) {
+    return "old_state_only";
+  }
+  return "unknown";
+}
+
+static std::string mtStateUpdateRhsTimingEvidence(const MtBoundaryInfo& boundary,
+                                                  const std::string& rhsTimingClass) {
+  if (rhsTimingClass == "precomputed") return "reg_src_commit_reads_next_state_object";
+  if (rhsTimingClass == "old_state_only") return "reg_dst_assign_tree_old_state_only";
+  if (!boundary.hasStateUpdate) return "no_state_update";
+  if (boundary.hasAmbiguousStateTarget || boundary.stateTargetNames.empty()) return "target_identity_ambiguous";
+  if (boundary.stateTargetNames.size() > 1) return "multiple_state_targets";
+  if (boundary.hasReset || boundary.hasAsyncReset || boundary.hasActivateAllPath) return "reset_or_activate_all";
+  if (mtStateUpdateHasMemoryOrDynamicArray(boundary)) return "memory_or_dynamic_array";
+  if (mtStateUpdateHasExternalOrSpecial(boundary)) return "external_or_special_or_unknown";
+  if (boundary.hasRhsNextStateObjectRead) return "rhs_reads_next_state_object";
+  if (boundary.hasUnexpandedRhsDependency) return "rhs_dependency_unexpanded";
+  return "mixed_or_unproven_state_update";
+}
+
+static bool mtStateUpdateActivationCanUseDelta(const MtBoundaryInfo& boundary) {
+  if (!boundary.hasStateUpdate) return false;
+  if (boundary.hasReset || boundary.hasAsyncReset || boundary.hasActivateAllPath) return false;
+  if (mtStateUpdateHasMemoryOrDynamicArray(boundary)) return false;
+  if (mtStateUpdateHasExternalOrSpecial(boundary)) return false;
+  return true;
+}
+
+static std::vector<std::string> mtStateUpdateBlockReasons(const MtBoundaryInfo& boundary,
+                                                          SuperNode* super,
+                                                          const std::string& rhsTimingClass,
+                                                          bool rhsReadsSameCycleTarget) {
+  std::vector<std::string> reasons;
+  if (!boundary.hasStateUpdate) {
+    addSerialReason(reasons, "no_state_update");
+  } else {
+    if (boundary.stateTargetNames.empty() || boundary.hasAmbiguousStateTarget) {
+      addSerialReason(reasons, "target_identity_ambiguous");
+    }
+    if (boundary.stateTargetNames.size() > 1) addSerialReason(reasons, "multiple_state_targets");
+    if (rhsTimingClass == "unknown") addSerialReason(reasons, "rhs_timing_unknown");
+    if (rhsReadsSameCycleTarget) addSerialReason(reasons, "rhs_reads_same_cycle_target");
+  }
+  if (boundary.hasReset) addSerialReason(reasons, "reset_behavior");
+  if (boundary.hasAsyncReset) addSerialReason(reasons, "async_reset_behavior");
+  if (mtStateUpdateHasMemoryOrDynamicArray(boundary)) addSerialReason(reasons, "memory_or_dynamic_array");
+  if (mtStateUpdateHasExternalOrSpecial(boundary)) addSerialReason(reasons, "external_or_special_or_unknown");
+  if (boundary.hasStateUpdate && !mtStateUpdateActivationCanUseDelta(boundary)) addSerialReason(reasons, "activation_delta_unproven");
+  if (super->superType != SUPER_VALID) addSerialReason(reasons, "non_valid_super_type");
+  return reasons;
+}
+
+static std::string mtStateUpdateCandidateKind(const MtBoundaryInfo& boundary,
+                                              const std::vector<std::string>& blockReasons) {
+  if (!boundary.hasStateUpdate) return "blocked";
+  if (blockReasons.empty() && boundary.stateTargetNames.size() == 1) return "safe_candidate";
+  if (blockReasons.size() == 1 && blockReasons[0] == "multiple_state_targets") return "needs_split";
+  return "blocked";
+}
+
+struct MtStateTargetWriterInfo {
+  int writerCount = 0;
+  std::set<int> writerCppIds;
+  int multiTargetWriterCount = 0;
+};
+
+struct MtStateTargetWriterUniverse {
+  std::map<std::string, MtStateTargetWriterInfo> targetWriters;
+  bool hasIncompleteWriterUniverse = false;
+  std::set<int> incompleteWriterCppIds;
+};
+
+static const size_t MT_STATE_TARGET_WRITER_ID_LIMIT = 16;
+
+static MtStateTargetWriterUniverse
+collectMtStateTargetWriters(const std::map<int, MtTaskInfo>& mtTasks) {
+  MtStateTargetWriterUniverse universe;
+  for (const auto& iter : mtTasks) {
+    int cppId = iter.first;
+    const MtBoundaryInfo& boundary = iter.second.boundary;
+    if (!boundary.hasStateUpdate) continue;
+    if (boundary.stateTargetNames.empty() || boundary.hasAmbiguousStateTarget) {
+      universe.hasIncompleteWriterUniverse = true;
+      universe.incompleteWriterCppIds.insert(cppId);
+      continue;
+    }
+    bool multiTargetWriter = boundary.stateTargetNames.size() > 1;
+    for (const std::string& target : boundary.stateTargetNames) {
+      universe.targetWriters[target].writerCount ++;
+      universe.targetWriters[target].writerCppIds.insert(cppId);
+      if (multiTargetWriter) universe.targetWriters[target].multiTargetWriterCount ++;
+    }
+  }
+  return universe;
+}
+
+static MtStateTargetWriterInfo mtStateUpdateWriterInfo(
+    const MtBoundaryInfo& boundary,
+    const std::map<std::string, MtStateTargetWriterInfo>& targetWriters) {
+  MtStateTargetWriterInfo info;
+  if (boundary.stateTargetNames.size() != 1) return info;
+  const std::string& target = *boundary.stateTargetNames.begin();
+  auto iter = targetWriters.find(target);
+  if (iter == targetWriters.end()) return info;
+  info.writerCount = iter->second.writerCount;
+  info.multiTargetWriterCount = iter->second.multiTargetWriterCount;
+  for (int cppId : iter->second.writerCppIds) {
+    if (info.writerCppIds.size() >= MT_STATE_TARGET_WRITER_ID_LIMIT) break;
+    info.writerCppIds.insert(cppId);
+  }
+  return info;
+}
+
+static std::string mtStateUpdateTargetWriterConflictKind(
+    const MtBoundaryInfo& boundary,
+    const MtStateTargetWriterInfo& writerInfo,
+    bool hasIncompleteWriterUniverse) {
+  if (!boundary.hasStateUpdate || boundary.stateTargetNames.empty()) return "none";
+  if (boundary.stateTargetNames.size() != 1) return "multi_target_unproven";
+  if (writerInfo.writerCount <= 1 && hasIncompleteWriterUniverse) return "writer_universe_incomplete";
+  if (writerInfo.writerCount <= 1) return "unique_writer";
+  return "multi_writer_unproven";
+}
+
+static std::string mtStateUpdateTargetWriterProof(const std::string& conflictKind) {
+  if (conflictKind == "unique_writer") return "target_unique_writer";
+  if (conflictKind == "multi_writer_unproven") return "none";
+  return "none";
+}
+
+static std::vector<std::string> mtStateUpdateRuntimeBlockReasons(
+    const std::string& stateUpdateCandidateKind,
+    const std::string& targetWriterConflictKind,
+    const MtStateTargetWriterInfo& writerInfo) {
+  std::vector<std::string> reasons;
+  if (stateUpdateCandidateKind != "safe_candidate") addSerialReason(reasons, "not_local_safe_candidate");
+  if (targetWriterConflictKind == "multi_writer_unproven") {
+    addSerialReason(reasons, "target_multi_writer_unproven");
+    if (writerInfo.multiTargetWriterCount > 0) addSerialReason(reasons, "target_multi_target_writer_unproven");
+  } else if (targetWriterConflictKind == "multi_target_unproven") {
+    addSerialReason(reasons, "target_multi_target_unproven");
+  } else if (targetWriterConflictKind == "writer_universe_incomplete") {
+    addSerialReason(reasons, "target_writer_universe_incomplete");
+  } else if (targetWriterConflictKind != "unique_writer") {
+    addSerialReason(reasons, "target_writer_proof_missing");
+  }
+  return reasons;
+}
+
+static std::set<std::string> collectAllMtStateTargetNames(const std::map<int, MtTaskInfo>& mtTasks) {
+  std::set<std::string> names;
+  for (const auto& iter : mtTasks) {
+    const MtBoundaryInfo& boundary = iter.second.boundary;
+    names.insert(boundary.stateTargetNames.begin(), boundary.stateTargetNames.end());
+  }
+  return names;
+}
+
 static void applyRepCutLiteSelection(std::map<int, MtTaskInfo>& tasks) {
   int remainingBudget = globalConfig.MtRepCutCopyBudget;
   bool enabled = globalConfig.MtRepCutLiteMode == "on";
@@ -1080,6 +1673,8 @@ void graph::dumpMtScheduleJson() {
   FILE* fp = std::fopen(path.c_str(), "w");
   Assert(fp != nullptr, "failed to open mt schedule json %s", path.c_str());
   std::map<int, MtTaskInfo> mtTasks = buildMtTaskInfoMapWithRepCut();
+  std::set<std::string> allStateTargetNames = collectAllMtStateTargetNames(mtTasks);
+  MtStateTargetWriterUniverse stateTargetWriterUniverse = collectMtStateTargetWriters(mtTasks);
 
   fprintf(fp, "{\n");
   fprintf(fp, "  \"format\": \"gsim.mt-schedule.v1\",\n");
@@ -1148,6 +1743,64 @@ void graph::dumpMtScheduleJson() {
     dumpJsonStringArray(fp, boundary.clockNames);
     fprintf(fp, "\n");
     fprintf(fp, "      },\n");
+
+    std::string rhsTimingClass = mtStateUpdateRhsTimingClass(boundary);
+    std::string rhsTimingEvidence = mtStateUpdateRhsTimingEvidence(boundary, rhsTimingClass);
+    bool rhsReadsSameCycleTarget = mtStateUpdateHasSameCycleTargetRead(boundary, allStateTargetNames);
+    bool hasMemoryOrDynamicArray = mtStateUpdateHasMemoryOrDynamicArray(boundary);
+    bool hasExternalOrSpecial = mtStateUpdateHasExternalOrSpecial(boundary);
+    bool activationCanUseDelta = mtStateUpdateActivationCanUseDelta(boundary);
+    std::vector<std::string> stateUpdateBlockReasons = mtStateUpdateBlockReasons(boundary, super, rhsTimingClass, rhsReadsSameCycleTarget);
+    std::string stateUpdateCandidateKind = mtStateUpdateCandidateKind(boundary, stateUpdateBlockReasons);
+    MtStateTargetWriterInfo stateTargetWriterInfo = mtStateUpdateWriterInfo(boundary, stateTargetWriterUniverse.targetWriters);
+    std::string targetWriterConflictKind = mtStateUpdateTargetWriterConflictKind(
+        boundary, stateTargetWriterInfo, stateTargetWriterUniverse.hasIncompleteWriterUniverse);
+    std::string targetWriterProof = mtStateUpdateTargetWriterProof(targetWriterConflictKind);
+    std::vector<std::string> runtimeBlockReasons = mtStateUpdateRuntimeBlockReasons(
+        stateUpdateCandidateKind, targetWriterConflictKind, stateTargetWriterInfo);
+    bool runtimeSafeCandidate = stateUpdateCandidateKind == "safe_candidate" && runtimeBlockReasons.empty();
+    fprintf(fp, "      \"state_update\": {\n");
+    fprintf(fp, "        \"has_state_update\": %s,\n", boundary.hasStateUpdate ? "true" : "false");
+    fprintf(fp, "        \"state_target_names\": ");
+    dumpJsonStringArray(fp, boundary.stateTargetNames);
+    fprintf(fp, ",\n");
+    fprintf(fp, "        \"state_target_count\": %zu,\n", boundary.stateTargetNames.size());
+    fprintf(fp, "        \"single_target\": %s,\n", boundary.stateTargetNames.size() == 1 ? "true" : "false");
+    fprintf(fp, "        \"rhs_timing_class\": \"%s\",\n", rhsTimingClass.c_str());
+    fprintf(fp, "        \"rhs_timing_evidence\": \"%s\",\n", rhsTimingEvidence.c_str());
+    fprintf(fp, "        \"rhs_reads_state_targets\": ");
+    dumpJsonStringArray(fp, boundary.rhsReadStateTargetNames);
+    fprintf(fp, ",\n");
+    fprintf(fp, "        \"rhs_reads_same_cycle_target\": %s,\n", rhsReadsSameCycleTarget ? "true" : "false");
+    fprintf(fp, "        \"has_reset_behavior\": %s,\n", boundary.hasReset ? "true" : "false");
+    fprintf(fp, "        \"has_async_reset_behavior\": %s,\n", boundary.hasAsyncReset ? "true" : "false");
+    fprintf(fp, "        \"has_memory_or_dynamic_array\": %s,\n", hasMemoryOrDynamicArray ? "true" : "false");
+    fprintf(fp, "        \"has_external_or_special\": %s,\n", hasExternalOrSpecial ? "true" : "false");
+    fprintf(fp, "        \"activation_fanout_count\": %zu,\n", activeFanout.size());
+    fprintf(fp, "        \"activation_can_use_delta\": %s,\n", activationCanUseDelta ? "true" : "false");
+    fprintf(fp, "        \"candidate_kind\": \"%s\",\n", stateUpdateCandidateKind.c_str());
+    fprintf(fp, "        \"block_reasons\": ");
+    dumpJsonStringArray(fp, stateUpdateBlockReasons);
+    fprintf(fp, "\n");
+    fprintf(fp, "      },\n");
+
+    fprintf(fp, "      \"state_update_group\": {\n");
+    fprintf(fp, "        \"local_safe_candidate\": %s,\n", stateUpdateCandidateKind == "safe_candidate" ? "true" : "false");
+    fprintf(fp, "        \"runtime_safe_candidate\": %s,\n", runtimeSafeCandidate ? "true" : "false");
+    fprintf(fp, "        \"target_writer_count\": %d,\n", stateTargetWriterInfo.writerCount);
+    fprintf(fp, "        \"target_multi_target_writer_count\": %d,\n", stateTargetWriterInfo.multiTargetWriterCount);
+    fprintf(fp, "        \"target_writer_universe_complete\": %s,\n",
+            stateTargetWriterUniverse.hasIncompleteWriterUniverse ? "false" : "true");
+    fprintf(fp, "        \"target_writer_cpp_ids\": ");
+    dumpJsonIntArray(fp, stateTargetWriterInfo.writerCppIds);
+    fprintf(fp, ",\n");
+    fprintf(fp, "        \"target_writer_conflict_kind\": \"%s\",\n", targetWriterConflictKind.c_str());
+    fprintf(fp, "        \"target_writer_proof\": \"%s\",\n", targetWriterProof.c_str());
+    fprintf(fp, "        \"runtime_block_reasons\": ");
+    dumpJsonStringArray(fp, runtimeBlockReasons);
+    fprintf(fp, "\n");
+    fprintf(fp, "      },\n");
+
     fprintf(fp, "      \"repcut\": {\n");
     fprintf(fp, "        \"is_source\": %s,\n", mtTask.isSource ? "true" : "false");
     fprintf(fp, "        \"is_sink\": %s,\n", mtTask.isSink ? "true" : "false");
@@ -1309,6 +1962,88 @@ void graph::dumpMtRepCutLiteReport() {
          superId, selectedCount, selectedCost, path.c_str());
 }
 
+void graph::dumpMtCoarseRegionReport() {
+  std::string baseName = globalConfig.InputBaseName.empty() ? name : globalConfig.InputBaseName;
+  std::string path = globalConfig.OutputDir + "/" + baseName + "_mt_coarse_regions.json";
+  FILE* fp = std::fopen(path.c_str(), "w");
+  Assert(fp != nullptr, "failed to open mt coarse-region report %s", path.c_str());
+  std::map<int, MtTaskInfo> mtTasks = buildMtTaskInfoMapWithRepCutSelection();
+  MtCoarseRegionPlan coarsePlan = planMtCoarseRegions(mtTasks);
+  MtPureBatchPlan fallbackPlan = planMtPureBatchesActiveFrequency(mtTasks, globalConfig.MtRepCutLiteMode == "on");
+
+  int runtimeEligibleCount = 0;
+  int maxTaskCount = 0;
+  int maxActiveWordSpan = 0;
+  int maxParallelWidth = 0;
+  std::map<std::string, int> blockerCounts;
+  for (const MtCoarseRegion& region : coarsePlan.regions) {
+    if (region.runtimeEligible) runtimeEligibleCount ++;
+    maxTaskCount = std::max(maxTaskCount, region.taskCount);
+    maxActiveWordSpan = std::max(maxActiveWordSpan, region.activeWordSpan);
+    maxParallelWidth = std::max(maxParallelWidth, region.estimatedMaxParallelWidth);
+    for (const std::string& blocker : region.blockers) blockerCounts[blocker] ++;
+  }
+
+  fprintf(fp, "{\n");
+  fprintf(fp, "  \"format\": \"gsim.mt-coarse-region-report.v1\",\n");
+  fprintf(fp, "  \"mode\": \"%s\",\n", globalConfig.MtBatchFormationMode.c_str());
+  fprintf(fp, "  \"task_count\": %d,\n", superId);
+  fprintf(fp, "  \"active_width\": %d,\n", ACTIVE_WIDTH);
+  fprintf(fp, "  \"same_word_fallback_batch_count\": %zu,\n", fallbackPlan.batches.size());
+  fprintf(fp, "  \"candidate_region_count\": %zu,\n", coarsePlan.regions.size());
+  fprintf(fp, "  \"runtime_eligible_region_count\": %d,\n", runtimeEligibleCount);
+  fprintf(fp, "  \"max_task_count\": %d,\n", maxTaskCount);
+  fprintf(fp, "  \"max_active_word_span\": %d,\n", maxActiveWordSpan);
+  fprintf(fp, "  \"max_parallel_width\": %d,\n", maxParallelWidth);
+  fprintf(fp, "  \"blocker_counts\": {");
+  bool firstBlocker = true;
+  for (const auto& blocker : blockerCounts) {
+    if (!firstBlocker) fprintf(fp, ", ");
+    firstBlocker = false;
+    fprintf(fp, "\"%s\": %d", jsonEscape(blocker.first).c_str(), blocker.second);
+  }
+  fprintf(fp, "},\n");
+  fprintf(fp, "  \"regions\": [\n");
+  for (size_t i = 0; i < coarsePlan.regions.size(); i ++) {
+    const MtCoarseRegion& region = coarsePlan.regions[i];
+    fprintf(fp, "    {\n");
+    fprintf(fp, "      \"begin_cpp_id\": %d,\n", region.beginCppId);
+    fprintf(fp, "      \"end_cpp_id\": %d,\n", region.endCppId);
+    fprintf(fp, "      \"task_count\": %d,\n", region.taskCount);
+    fprintf(fp, "      \"active_word_span\": %d,\n", region.activeWordSpan);
+    fprintf(fp, "      \"static_cost\": %d,\n", region.staticCost);
+    fprintf(fp, "      \"member_node_cost\": %d,\n", region.memberNodeCost);
+    fprintf(fp, "      \"expected_active_cost\": %d,\n", region.expectedActiveCost);
+    fprintf(fp, "      \"pure_task_count\": %d,\n", region.pureTaskCount);
+    fprintf(fp, "      \"serial_blocker_count\": %d,\n", region.serialBlockerCount);
+    fprintf(fp, "      \"dependency_edges_inside\": %d,\n", region.dependencyEdgeCount);
+    fprintf(fp, "      \"active_visibility_edges\": %d,\n", region.activeVisibilityEdgeCount);
+    fprintf(fp, "      \"same_cycle_activation_hazards\": %d,\n", region.sameCycleActivationHazardCount);
+    fprintf(fp, "      \"estimated_layer_count\": %d,\n", region.estimatedLayerCount);
+    fprintf(fp, "      \"estimated_max_parallel_width\": %d,\n", region.estimatedMaxParallelWidth);
+    fprintf(fp, "      \"bounded_repcut_lite_could_remove_blocking_dependency\": %s,\n", region.repcutLiteCouldHelp ? "true" : "false");
+    fprintf(fp, "      \"replication_candidate_count\": %d,\n", region.replicationCandidateCount);
+    fprintf(fp, "      \"runtime_eligible\": %s,\n", region.runtimeEligible ? "true" : "false");
+    fprintf(fp, "      \"blockers\": ");
+    dumpJsonStringArray(fp, region.blockers);
+    fprintf(fp, ",\n");
+    fprintf(fp, "      \"layers\": [\n");
+    for (size_t layerIdx = 0; layerIdx < region.layers.size(); layerIdx ++) {
+      const MtCoarseLayer& layer = region.layers[layerIdx];
+      fprintf(fp, "        {\"index\": %zu, \"task_cpp_ids\": ", layerIdx);
+      dumpJsonIntArray(fp, layer.taskCppIds);
+      fprintf(fp, "}%s\n", layerIdx + 1 == region.layers.size() ? "" : ",");
+    }
+    fprintf(fp, "      ]\n");
+    fprintf(fp, "    }%s\n", i + 1 == coarsePlan.regions.size() ? "" : ",");
+  }
+  fprintf(fp, "  ]\n");
+  fprintf(fp, "}\n");
+  fclose(fp);
+  printf("[mt-coarse-region] wrote %zu regions (%d runtime eligible) to %s\n",
+         coarsePlan.regions.size(), runtimeEligibleCount, path.c_str());
+}
+
 std::pair<int, int> cppId2flagIdx(int cppId) {
   int id = cppId / ACTIVE_WIDTH;
   int bit = cppId % ACTIVE_WIDTH;
@@ -1439,8 +2174,11 @@ FILE* graph::genHeaderStart() {
   includeLib(header, "map", true);
   includeLib(header, "cstdarg", true);
   includeLib(header, "thread", true);
+  includeLib(header, "mutex", true);
+  includeLib(header, "condition_variable", true);
   includeLib(header, "chrono", true);
   includeLib(header, "cstdlib", true);
+  includeLib(header, "algorithm", true);
   newLine(header);
 
   fprintf(header, "\n// User configuration\n");
@@ -1521,25 +2259,93 @@ void graph::genHeaderEnd(FILE* fp) {
 }
 
 static void emitActiveBufferDef(FILE* header, int activeWords) {
+  int packedActiveWords = 64 / ACTIVE_WIDTH;
   fprintf(header,
           "struct ActiveBuffer {\n"
           "  uint%d_t words[%d];\n"
-          "  void clear() {\n"
+          "  int touchedWords[%d];\n"
+          "  int touchedCount;\n"
+          "  bool allActive;\n"
+          "  ActiveBuffer() : touchedCount(0), allActive(false) {\n"
           "    memset(words, 0, sizeof(words));\n"
           "  }\n"
+          "  void clear() {\n"
+          "    if (allActive) {\n"
+          "      memset(words, 0, sizeof(words));\n"
+          "      allActive = false;\n"
+          "      touchedCount = 0;\n"
+          "      return;\n"
+          "    }\n"
+          "    for (int touchedIdx = 0; touchedIdx < touchedCount; touchedIdx ++) words[touchedWords[touchedIdx]] = 0;\n"
+          "    touchedCount = 0;\n"
+          "  }\n"
           "  void orWord(int idx, uint64_t mask) {\n"
-          "    for (int i = 0; i < 8 && idx + i < %d; i ++) {\n"
-          "      words[idx + i] |= (uint%d_t)(mask >> (i * %d));\n"
+          "    // mask packs consecutive active words in little-endian ACTIVE_WIDTH chunks.\n"
+          "    for (int i = 0; i < %d && idx + i < %d; i ++) {\n"
+          "      uint%d_t value = (uint%d_t)(mask >> (i * %d));\n"
+          "      if (value == 0) continue;\n"
+          "      int wordIdx = idx + i;\n"
+          "      if (!allActive && words[wordIdx] == 0) touchedWords[touchedCount ++] = wordIdx;\n"
+          "      words[wordIdx] |= value;\n"
           "    }\n"
           "  }\n"
           "  void activateAll() {\n"
           "    memset(words, 0xff, sizeof(words));\n"
+          "    touchedCount = 0;\n"
+          "    allActive = true;\n"
           "  }\n"
           "  void mergeFrom(uint%d_t *activeFlags) const {\n"
-          "    for (int i = 0; i < %d; i ++) activeFlags[i] |= words[i];\n"
+          "    if (allActive) {\n"
+          "      for (int i = 0; i < %d; i ++) activeFlags[i] |= words[i];\n"
+          "      return;\n"
+          "    }\n"
+          "    for (int touchedIdx = 0; touchedIdx < touchedCount; touchedIdx ++) {\n"
+          "      int wordIdx = touchedWords[touchedIdx];\n"
+          "      activeFlags[wordIdx] |= words[wordIdx];\n"
+          "    }\n"
           "  }\n"
           "};\n\n",
-          ACTIVE_WIDTH, activeWords, activeWords, ACTIVE_WIDTH, ACTIVE_WIDTH, ACTIVE_WIDTH, activeWords);
+          ACTIVE_WIDTH, activeWords, activeWords, packedActiveWords, activeWords, ACTIVE_WIDTH, ACTIVE_WIDTH, ACTIVE_WIDTH, ACTIVE_WIDTH, activeWords);
+}
+
+static void emitActivationDeltaDef(FILE* header, int activeWords) {
+  int packedActiveWords = 64 / ACTIVE_WIDTH;
+  fprintf(header,
+          "struct ActivationDeltaEntry {\n"
+          "  int idx;\n"
+          "  uint64_t mask;\n"
+          "};\n"
+          "struct ActivationDelta {\n"
+          "  std::vector<ActivationDeltaEntry> entries;\n"
+          "  bool allActive;\n"
+          "  ActivationDelta() : allActive(false) {}\n"
+          "  void clear() {\n"
+          "    entries.clear();\n"
+          "    allActive = false;\n"
+          "  }\n"
+          "  void orWord(int idx, uint64_t mask) {\n"
+          "    // mask packs consecutive active words in little-endian ACTIVE_WIDTH chunks.\n"
+          "    for (int i = 0; i < %d && idx + i < %d; i ++) {\n"
+          "      uint%d_t value = (uint%d_t)(mask >> (i * %d));\n"
+          "      if (value == 0) continue;\n"
+          "      int wordIdx = idx + i;\n"
+          "      entries.push_back({wordIdx, value});\n"
+          "    }\n"
+          "  }\n"
+          "  void activateAll() {\n"
+          "    allActive = true;\n"
+          "  }\n"
+          "  void mergeInto(uint%d_t *activeFlags) const {\n"
+          "    if (allActive) {\n"
+          "      for (int i = 0; i < %d; i ++) activeFlags[i] = (uint%d_t)-1;\n"
+          "      return;\n"
+          "    }\n"
+          "    for (const ActivationDeltaEntry &entry : entries) {\n"
+          "      activeFlags[entry.idx] |= (uint%d_t)entry.mask;\n"
+          "    }\n"
+          "  }\n"
+          "};\n\n",
+          packedActiveWords, activeWords, ACTIVE_WIDTH, ACTIVE_WIDTH, ACTIVE_WIDTH, ACTIVE_WIDTH, activeWords, ACTIVE_WIDTH, ACTIVE_WIDTH);
 }
 
 #if defined(DIFFTEST_PER_SIG) && defined(GSIM_DIFF)
@@ -1930,9 +2736,9 @@ int graph::genActivate() {
     return nextSubStepIdx - 1; // return the maxinum subStepIdx currently used
 }
 
-void graph::genMtTaskHelper(SuperNode* super, bool buffered) {
+void graph::genMtTaskHelper(SuperNode* super, bool buffered, const std::string& activeSinkType) {
   if (buffered) {
-    emitFuncDecl(0, "void S%s::mtTask%d(uint%d_t &flag, ActiveBuffer &nextActive) {\n", name.c_str(), super->cppId, ACTIVE_WIDTH);
+    emitFuncDecl(0, "void S%s::mtTask%d(uint%d_t &flag, %s &nextActive) {\n", name.c_str(), super->cppId, ACTIVE_WIDTH, activeSinkType.c_str());
     genSuperEval(super, "flag", "nextActive", 1);
   } else {
     emitFuncDecl(0, "void S%s::mtTask%d(uint%d_t &flag) {\n", name.c_str(), super->cppId, ACTIVE_WIDTH);
@@ -1941,8 +2747,8 @@ void graph::genMtTaskHelper(SuperNode* super, bool buffered) {
   emitBodyLock(0, "}\n");
 }
 
-void graph::genMtRepCutLiteTaskHelper(SuperNode* super, const std::vector<MtRepCutClone>& clones) {
-  emitFuncDecl(0, "void S%s::mtRepCutLiteTask%d(uint%d_t &flag, ActiveBuffer &nextActive) {\n", name.c_str(), super->cppId, ACTIVE_WIDTH);
+void graph::genMtRepCutLiteTaskHelper(SuperNode* super, const std::vector<MtRepCutClone>& clones, const std::string& activeSinkType) {
+  emitFuncDecl(0, "void S%s::mtRepCutLiteTask%d(uint%d_t &flag, %s &nextActive) {\n", name.c_str(), super->cppId, ACTIVE_WIDTH, activeSinkType.c_str());
   std::map<Node*, std::string> replacements = mtRepCutReplacementMap(clones);
   for (const MtRepCutClone& clone : clones) {
     emitBodyLock(1, "%s %s = %s;\n", widthUType(clone.sourceNode->width).c_str(), clone.cloneName.c_str(), clone.expr.c_str());
@@ -1956,13 +2762,177 @@ void graph::genMtRepCutLiteTaskHelper(SuperNode* super, const std::vector<MtRepC
 void graph::genMtTaskRunner(const MtRepCutSemanticPlan& semanticPlan) {
   std::map<int, MtTaskInfo> mtTasks = buildMtTaskInfoMapWithRepCutSelection();
   markMtRepCutLiteRuntimeApplied(mtTasks);
+  int shardCount = mtPureBatchShardCount();
+  bool useCoarse = globalConfig.MtBatchFormationMode == "coarse";
+  auto emitPureTaskSwitchCases = [&](int shardBegin, int shardEnd, bool workerMode) {
+    for (int cppId = shardBegin; cppId < shardEnd; cppId ++) {
+      if (mtTasks[cppId].taskKind != "pure_compute") continue;
+      emitBodyLock(4, "case %d:\n", cppId);
+      if (workerMode) {
+        emitBodyLock(5, "if (mtWorkerFlags[worker] & 0x%lx) {\n", (uint64_t)1 << (cppId % ACTIVE_WIDTH));
+        emitBodyLock(6, "if (mtProfileEnabled) {\n");
+        if (mtTasks[cppId].repcutRuntimeApplied) {
+          emitBodyLock(7, "mtRepCutLiteTask%d(mtWorkerFlags[worker], mtWorkerDeltas[worker]);\n", cppId);
+        } else {
+          emitBodyLock(7, "mtTask%d(mtWorkerFlags[worker], mtWorkerDeltas[worker]);\n", cppId);
+        }
+        emitBodyLock(7, "mtProfileLocalTaskIds[worker].push_back(%d);\n", cppId);
+        emitBodyLock(7, "mtProfileLocalWorkerTaskCount[worker] ++;\n");
+        emitBodyLock(6, "} else {\n");
+        if (mtTasks[cppId].repcutRuntimeApplied) {
+          emitBodyLock(7, "mtRepCutLiteTask%d(mtWorkerFlags[worker], mtWorkerDeltas[worker]);\n", cppId);
+        } else {
+          emitBodyLock(7, "mtTask%d(mtWorkerFlags[worker], mtWorkerDeltas[worker]);\n", cppId);
+        }
+        emitBodyLock(6, "}\n");
+        emitBodyLock(5, "}\n");
+      } else {
+        emitBodyLock(5, "if (activeWord & 0x%lx) {\n", (uint64_t)1 << (cppId % ACTIVE_WIDTH));
+        emitBodyLock(6, "if (mtProfileEnabled) {\n");
+        emitBodyLock(7, "std::chrono::steady_clock::time_point mtProfileTaskBegin = std::chrono::steady_clock::now();\n");
+        emitBodyLock(7, "mtTask%d(activeWord);\n", cppId);
+        emitBodyLock(7, "recordMtProfileTask(%d, true, std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - mtProfileTaskBegin).count());\n", cppId);
+        emitBodyLock(7, "mtProfileWorkerTaskCount[0] ++;\n");
+        emitBodyLock(6, "} else {\n");
+        emitBodyLock(7, "mtTask%d(activeWord);\n", cppId);
+        emitBodyLock(6, "}\n");
+        emitBodyLock(5, "}\n");
+      }
+      emitBodyLock(5, "break;\n");
+    }
+  };
+  for (int shard = 0; shard < shardCount; shard ++) {
+    int shardBegin = shard * MT_PURE_BATCH_SHARD_SIZE;
+    int shardEnd = std::min(superId, shardBegin + MT_PURE_BATCH_SHARD_SIZE);
+    emitFuncDecl(0, "void S%s::mtRunPureBatchDirectShard%d(int chunkBegin, int chunkEnd, uint%d_t &activeWord) {\n",
+                 name.c_str(), shard, ACTIVE_WIDTH);
+    emitBodyLock(1, "if (chunkEnd <= %d || chunkBegin >= %d) return;\n", shardBegin, shardEnd);
+    emitBodyLock(1, "int localBegin = std::max(chunkBegin, %d);\n", shardBegin);
+    emitBodyLock(1, "int localEnd = std::min(chunkEnd, %d);\n", shardEnd);
+    emitBodyLock(1, "for (int cppId = localBegin; cppId < localEnd; cppId ++) {\n");
+    emitBodyLock(2, "switch (cppId) {\n");
+    emitPureTaskSwitchCases(shardBegin, shardEnd, false);
+    emitBodyLock(3, "default:\n");
+    emitBodyLock(4, "break;\n");
+    emitBodyLock(2, "}\n");
+    emitBodyLock(1, "}\n");
+    emitBodyLock(0, "}\n");
+
+    emitFuncDecl(0, "void S%s::mtRunPureBatchWorkerShard%d(int worker, int chunkBegin, int chunkEnd, std::vector<std::vector<int>> &mtProfileLocalTaskIds, std::vector<uint64_t> &mtProfileLocalWorkerTaskCount) {\n",
+                 name.c_str(), shard);
+    emitBodyLock(1, "if (chunkEnd <= %d || chunkBegin >= %d) return;\n", shardBegin, shardEnd);
+    emitBodyLock(1, "int localBegin = std::max(chunkBegin, %d);\n", shardBegin);
+    emitBodyLock(1, "int localEnd = std::min(chunkEnd, %d);\n", shardEnd);
+    emitBodyLock(1, "for (int cppId = localBegin; cppId < localEnd; cppId ++) {\n");
+    emitBodyLock(2, "switch (cppId) {\n");
+    emitPureTaskSwitchCases(shardBegin, shardEnd, true);
+    emitBodyLock(3, "default:\n");
+    emitBodyLock(4, "break;\n");
+    emitBodyLock(2, "}\n");
+    emitBodyLock(1, "}\n");
+    emitBodyLock(0, "}\n");
+  }
+  emitFuncDecl(0, "void S%s::mtRunPureBatchWorkerRange(int worker, int chunkBegin, int chunkEnd) {\n", name.c_str());
+  emitBodyLock(1, "if (chunkEnd <= chunkBegin) return;\n");
+  emitBodyLock(1, "int firstShard = chunkBegin / %d;\n", MT_PURE_BATCH_SHARD_SIZE);
+  emitBodyLock(1, "int lastShard = (chunkEnd - 1) / %d;\n", MT_PURE_BATCH_SHARD_SIZE);
+  emitBodyLock(1, "for (int shard = firstShard; shard <= lastShard; shard ++) {\n");
+  emitBodyLock(2, "switch (shard) {\n");
+  for (int shard = 0; shard < shardCount; shard ++) {
+    emitBodyLock(3, "case %d:\n", shard);
+    emitBodyLock(4, "mtRunPureBatchWorkerShard%d(worker, chunkBegin, chunkEnd, mtProfileLocalTaskIds, mtProfileLocalWorkerTaskCount);\n", shard);
+    emitBodyLock(4, "break;\n");
+  }
+  emitBodyLock(3, "default:\n");
+  emitBodyLock(4, "break;\n");
+  emitBodyLock(2, "}\n");
+  emitBodyLock(1, "}\n");
+  emitBodyLock(0, "}\n");
+
+  emitFuncDecl(0, "void S%s::mtWorkerPoolLoop(int worker) {\n", name.c_str());
+  emitBodyLock(1, "uint64_t seenGeneration = 0;\n");
+  emitBodyLock(1, "while (true) {\n");
+  emitBodyLock(2, "int chunkBegin = 0;\n");
+  emitBodyLock(2, "int chunkEnd = 0;\n");
+  if (useCoarse) {
+    emitBodyLock(2, "int jobKind = 0;\n");
+    emitBodyLock(2, "int coarseRegionIndex = -1;\n");
+    emitBodyLock(2, "int coarseLayerIndex = -1;\n");
+  }
+  emitBodyLock(2, "uint64_t generation = 0;\n");
+  emitBodyLock(2, "{\n");
+  emitBodyLock(3, "std::unique_lock<std::mutex> lock(mtWorkerPoolMutex);\n");
+  emitBodyLock(3, "mtWorkerPoolCv.wait(lock, [&]() { return mtWorkerPoolStop || mtWorkerPoolGeneration != seenGeneration; });\n");
+  emitBodyLock(3, "if (mtWorkerPoolStop) return;\n");
+  emitBodyLock(3, "generation = mtWorkerPoolGeneration;\n");
+  emitBodyLock(3, "seenGeneration = generation;\n");
+  emitBodyLock(3, "if (worker >= mtWorkerPoolCurrentWorkerCount) continue;\n");
+  emitBodyLock(3, "chunkBegin = mtWorkerPoolChunkBegin[worker];\n");
+  emitBodyLock(3, "chunkEnd = mtWorkerPoolChunkEnd[worker];\n");
+  if (useCoarse) {
+    emitBodyLock(3, "jobKind = mtWorkerPoolJobKind;\n");
+    emitBodyLock(3, "coarseRegionIndex = mtWorkerPoolCoarseRegionIndex;\n");
+    emitBodyLock(3, "coarseLayerIndex = mtWorkerPoolCoarseLayerIndex;\n");
+  }
+  emitBodyLock(2, "}\n");
+  if (useCoarse) {
+    emitBodyLock(2, "if (jobKind == 1) mtRunCoarseLayerWorkerRange(worker, coarseRegionIndex, coarseLayerIndex, chunkBegin, chunkEnd);\n");
+    emitBodyLock(2, "else mtRunPureBatchWorkerRange(worker, chunkBegin, chunkEnd);\n");
+  } else {
+    emitBodyLock(2, "mtRunPureBatchWorkerRange(worker, chunkBegin, chunkEnd);\n");
+  }
+  emitBodyLock(2, "{\n");
+  emitBodyLock(3, "std::lock_guard<std::mutex> lock(mtWorkerPoolMutex);\n");
+  emitBodyLock(3, "if (generation == mtWorkerPoolGeneration) {\n");
+  emitBodyLock(4, "mtWorkerPoolDoneCount ++;\n");
+  emitBodyLock(4, "if (mtWorkerPoolDoneCount >= mtWorkerPoolCurrentWorkerCount) mtWorkerPoolDoneCv.notify_one();\n");
+  emitBodyLock(3, "}\n");
+  emitBodyLock(2, "}\n");
+  emitBodyLock(1, "}\n");
+  emitBodyLock(0, "}\n");
+
+  emitFuncDecl(0, "void S%s::startMtWorkerPool() {\n", name.c_str());
+  emitBodyLock(1, "if (!mtWorkerPoolEnabled || mtConfiguredWorkerCount <= 1 || !mtWorkerPoolThreads.empty()) return;\n");
+  emitBodyLock(1, "mtWorkerPoolThreadCount = mtConfiguredWorkerCount;\n");
+  emitBodyLock(1, "mtWorkerPoolChunkBegin.assign((size_t)mtWorkerPoolThreadCount, 0);\n");
+  emitBodyLock(1, "mtWorkerPoolChunkEnd.assign((size_t)mtWorkerPoolThreadCount, 0);\n");
+  emitBodyLock(1, "mtWorkerDeltas.resize((size_t)mtWorkerPoolThreadCount);\n");
+  emitBodyLock(1, "mtWorkerFlags.resize((size_t)mtWorkerPoolThreadCount);\n");
+  if (useCoarse) {
+    emitBodyLock(1, "mtWorkerCoarseFlags.resize((size_t)mtWorkerPoolThreadCount);\n");
+  }
+  emitBodyLock(1, "mtWorkerPoolThreads.reserve((size_t)mtWorkerPoolThreadCount);\n");
+  emitBodyLock(1, "for (int worker = 0; worker < mtWorkerPoolThreadCount; worker ++) {\n");
+  emitBodyLock(2, "mtWorkerPoolThreads.emplace_back([this, worker]() { mtWorkerPoolLoop(worker); });\n");
+  emitBodyLock(1, "}\n");
+  emitBodyLock(0, "}\n");
+
+  emitFuncDecl(0, "void S%s::stopMtWorkerPool() {\n", name.c_str());
+  emitBodyLock(1, "if (mtWorkerPoolThreads.empty()) return;\n");
+  emitBodyLock(1, "{\n");
+  emitBodyLock(2, "std::lock_guard<std::mutex> lock(mtWorkerPoolMutex);\n");
+  emitBodyLock(2, "mtWorkerPoolStop = true;\n");
+  emitBodyLock(1, "}\n");
+  emitBodyLock(1, "mtWorkerPoolCv.notify_all();\n");
+  emitBodyLock(1, "for (std::thread &worker : mtWorkerPoolThreads) {\n");
+  emitBodyLock(2, "if (worker.joinable()) worker.join();\n");
+  emitBodyLock(1, "}\n");
+  emitBodyLock(1, "mtWorkerPoolThreads.clear();\n");
+  emitBodyLock(0, "}\n");
+
   emitFuncDecl(0, "void S%s::mtRunPureBatch(int beginCppId, int endCppId, uint%d_t &activeWord) {\n", name.c_str(), ACTIVE_WIDTH);
   emitBodyLock(1, "int taskCount = endCppId - beginCppId;\n");
   emitBodyLock(1, "if (taskCount <= 0) return;\n");
   emitBodyLock(1, "std::chrono::steady_clock::time_point mtProfileBatchBegin;\n");
   emitBodyLock(1, "if (mtProfileEnabled) mtProfileBatchBegin = std::chrono::steady_clock::now();\n");
   emitBodyLock(1, "int workerCount = mtConfiguredWorkerCount;\n");
-  emitBodyLock(1, "if (taskCount < mtMinBatchTasks) workerCount = 1;\n");
+  emitBodyLock(1, "bool mtSkippedBelowMinBatch = false;\n");
+  emitBodyLock(1, "bool mtSkippedForcedSerialBatch = false;\n");
+  emitBodyLock(1, "if (taskCount < mtMinBatchTasks) {\n");
+  emitBodyLock(2, "if (mtProfileEnabled) mtProfileRejectBelowMinBatch ++;\n");
+  emitBodyLock(2, "mtSkippedBelowMinBatch = true;\n");
+  emitBodyLock(2, "workerCount = 1;\n");
+  emitBodyLock(1, "}\n");
   bool hasForcedSerialBatch = false;
   for (const MtRepCutBatch& batch : semanticPlan.cutBatches) {
     if (batch.forcedSerial) hasForcedSerialBatch = true;
@@ -1972,6 +2942,8 @@ void graph::genMtTaskRunner(const MtRepCutSemanticPlan& semanticPlan) {
     for (const MtRepCutBatch& batch : semanticPlan.cutBatches) {
       if (batch.forcedSerial) emitBodyLock(2, "case %d:\n", batch.beginCppId);
     }
+    emitBodyLock(3, "mtSkippedForcedSerialBatch = true;\n");
+    emitBodyLock(3, "if (mtProfileEnabled) mtProfileRejectDependencyEdge ++;\n");
     emitBodyLock(3, "workerCount = 1;\n");
     emitBodyLock(3, "break;\n");
     emitBodyLock(2, "default:\n");
@@ -1979,25 +2951,101 @@ void graph::genMtTaskRunner(const MtRepCutSemanticPlan& semanticPlan) {
     emitBodyLock(1, "}\n");
   }
   emitBodyLock(1, "if (workerCount > taskCount) workerCount = taskCount;\n");
-  emitBodyLock(1, "if (mtProfileEnabled && workerCount > mtProfileMaxWorkerCount) mtProfileMaxWorkerCount = workerCount;\n");
-  emitBodyLock(1, "if (mtProfileEnabled && mtProfileWorkerTaskCount.size() < (size_t)workerCount) mtProfileWorkerTaskCount.resize((size_t)workerCount, 0);\n");
-  emitBodyLock(1, "if (mtProfileEnabled) mtProfilePureBatchCount ++;\n");
-  emitBodyLock(1, "std::vector<uint64_t> mtProfileLocalWorkerTaskCount;\n");
-  emitBodyLock(1, "std::vector<std::vector<uint64_t>> mtProfileLocalTaskExec;\n");
+  emitBodyLock(1, "if (workerCount < 2) workerCount = 1;\n");
   emitBodyLock(1, "if (mtProfileEnabled) {\n");
-  emitBodyLock(2, "mtProfileLocalWorkerTaskCount.assign(workerCount, 0);\n");
-  emitBodyLock(2, "mtProfileLocalTaskExec.assign(workerCount, std::vector<uint64_t>(%d, 0));\n", superId);
+  emitBodyLock(2, "int batchSizeBucket = taskCount <= 1 ? 0 : (taskCount == 2 ? 1 : (taskCount <= 4 ? 2 : (taskCount <= 8 ? 3 : (taskCount <= 15 ? 4 : 5))));\n");
+  emitBodyLock(2, "mtProfileBatchSizeHist[batchSizeBucket] ++;\n");
+  emitBodyLock(2, "mtProfilePureBatchCount ++;\n");
   emitBodyLock(1, "}\n");
-  emitBodyLock(1, "std::vector<ActiveBuffer> workerBuffers(workerCount);\n");
-  emitBodyLock(1, "for (int worker = 0; worker < workerCount; worker ++) workerBuffers[worker].clear();\n");
-  emitBodyLock(1, "std::vector<uint%d_t> workerFlags(workerCount, activeWord);\n", ACTIVE_WIDTH);
+  if (!semanticPlan.batchPlan.batches.empty()) {
+    emitBodyLock(1, "if (mtProfileEnabled) {\n");
+    emitBodyLock(2, "switch (beginCppId) {\n");
+    for (auto batch : semanticPlan.batchPlan.batches) {
+      int memberNodeCount = 0;
+      int sameActiveWordForwardEdges = 0;
+      int crossBatchActivationFanout = 0;
+      for (int cppId = batch.first; cppId < batch.second; cppId ++) {
+        SuperNode* super = cppId2Super[cppId];
+        memberNodeCount += (int)super->member.size();
+        for (Node* member : super->member) {
+          for (int activeId : member->nextActiveId) {
+            if (activeId >= batch.first && activeId < batch.second && activeId > cppId &&
+                activeId / ACTIVE_WIDTH == cppId / ACTIVE_WIDTH) sameActiveWordForwardEdges ++;
+            if (activeId >= 0 && (activeId < batch.first || activeId >= batch.second)) crossBatchActivationFanout ++;
+          }
+        }
+      }
+      emitBodyLock(3, "case %d:\n", batch.first);
+      emitBodyLock(4, "mtProfileBatchMemberNodeCount += %d;\n", memberNodeCount);
+      emitBodyLock(4, "mtProfileSameActiveWordForwardEdges += %d;\n", sameActiveWordForwardEdges);
+      emitBodyLock(4, "mtProfileCrossBatchActivationFanout += %d;\n", crossBatchActivationFanout);
+      emitBodyLock(4, "break;\n");
+    }
+    emitBodyLock(3, "default:\n");
+    emitBodyLock(4, "break;\n");
+    emitBodyLock(2, "}\n");
+    emitBodyLock(1, "}\n");
+  }
+  emitBodyLock(1, "if (mtProfileEnabled && mtProfileWorkerTaskCount.size() < (size_t)workerCount) mtProfileWorkerTaskCount.resize((size_t)workerCount, 0);\n");
+  emitBodyLock(1, "if (workerCount == 1) {\n");
+  emitBodyLock(2, "if (mtProfileEnabled) {\n");
+  emitBodyLock(3, "mtProfileSkippedFakeParallelBatchCount ++;\n");
+  emitBodyLock(3, "if (mtProfileEffectiveWorkerCountHist.size() <= 1) mtProfileEffectiveWorkerCountHist.resize(2, 0);\n");
+  emitBodyLock(3, "mtProfileEffectiveWorkerCountHist[1] ++;\n");
+  emitBodyLock(3, "if (!mtSkippedBelowMinBatch && !mtSkippedForcedSerialBatch) mtProfileRejectConfiguredSingleWorker ++;\n");
+  emitBodyLock(2, "}\n");
+  if (!semanticPlan.cutBatches.empty()) {
+    emitBodyLock(2, "switch (beginCppId) {\n");
+    for (const MtRepCutBatch& batch : semanticPlan.cutBatches) {
+      uint64_t forcedSinkMask = mtRepCutForcedSinkMaskForBatch(semanticPlan, batch.beginCppId);
+      if (forcedSinkMask != 0) {
+        emitBodyLock(3, "case %d:\n", batch.beginCppId);
+        emitBodyLock(4, "activeWord |= 0x%lx;\n", forcedSinkMask);
+        emitBodyLock(4, "break;\n");
+      }
+    }
+    emitBodyLock(3, "default:\n");
+    emitBodyLock(4, "break;\n");
+    emitBodyLock(2, "}\n");
+  }
+  emitBodyLock(2, "int firstShard = beginCppId / %d;\n", MT_PURE_BATCH_SHARD_SIZE);
+  emitBodyLock(2, "int lastShard = (endCppId - 1) / %d;\n", MT_PURE_BATCH_SHARD_SIZE);
+  emitBodyLock(2, "for (int shard = firstShard; shard <= lastShard; shard ++) {\n");
+  emitBodyLock(3, "switch (shard) {\n");
+  for (int shard = 0; shard < shardCount; shard ++) {
+    emitBodyLock(4, "case %d:\n", shard);
+    emitBodyLock(5, "mtRunPureBatchDirectShard%d(beginCppId, endCppId, activeWord);\n", shard);
+    emitBodyLock(5, "break;\n");
+  }
+  emitBodyLock(4, "default:\n");
+  emitBodyLock(5, "break;\n");
+  emitBodyLock(3, "}\n");
+  emitBodyLock(2, "}\n");
+  emitBodyLock(2, "if (mtProfileEnabled) mtProfileBatchWallNs += std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - mtProfileBatchBegin).count();\n");
+  emitBodyLock(2, "return;\n");
+  emitBodyLock(1, "}\n");
+  emitBodyLock(1, "if (mtProfileEnabled) {\n");
+  emitBodyLock(2, "mtProfileTrueParallelBatchCount ++;\n");
+  emitBodyLock(2, "if (workerCount > mtProfileMaxWorkerCount) mtProfileMaxWorkerCount = workerCount;\n");
+  emitBodyLock(2, "if (mtProfileEffectiveWorkerCountHist.size() <= (size_t)workerCount) mtProfileEffectiveWorkerCountHist.resize((size_t)workerCount + 1, 0);\n");
+  emitBodyLock(2, "mtProfileEffectiveWorkerCountHist[(size_t)workerCount] ++;\n");
+  emitBodyLock(1, "}\n");
+  emitBodyLock(1, "if (mtProfileEnabled) {\n");
+  emitBodyLock(2, "mtProfileLocalWorkerTaskCount.assign((size_t)workerCount, 0);\n");
+  emitBodyLock(2, "mtProfileLocalTaskIds.clear();\n");
+  emitBodyLock(2, "mtProfileLocalTaskIds.resize((size_t)workerCount);\n");
+  emitBodyLock(1, "}\n");
+  emitBodyLock(1, "if (mtWorkerDeltas.size() < (size_t)workerCount) mtWorkerDeltas.resize((size_t)workerCount);\n");
+  emitBodyLock(1, "for (int worker = 0; worker < workerCount; worker ++) mtWorkerDeltas[worker].clear();\n");
+  emitBodyLock(1, "if (mtWorkerFlags.size() < (size_t)workerCount) mtWorkerFlags.resize((size_t)workerCount);\n");
+  emitBodyLock(1, "for (int worker = 0; worker < workerCount; worker ++) mtWorkerFlags[worker] = activeWord;\n");
   if (!semanticPlan.cutBatches.empty()) {
     emitBodyLock(1, "switch (beginCppId) {\n");
     for (const MtRepCutBatch& batch : semanticPlan.cutBatches) {
       uint64_t forcedSinkMask = mtRepCutForcedSinkMaskForBatch(semanticPlan, batch.beginCppId);
       if (forcedSinkMask != 0) {
         emitBodyLock(2, "case %d:\n", batch.beginCppId);
-        emitBodyLock(3, "for (int worker = 0; worker < workerCount; worker ++) workerFlags[worker] |= 0x%lx;\n", forcedSinkMask);
+        emitBodyLock(3, "for (int worker = 0; worker < workerCount; worker ++) mtWorkerFlags[worker] |= 0x%lx;\n", forcedSinkMask);
         emitBodyLock(3, "break;\n");
       }
     }
@@ -2005,64 +3053,263 @@ void graph::genMtTaskRunner(const MtRepCutSemanticPlan& semanticPlan) {
     emitBodyLock(3, "break;\n");
     emitBodyLock(1, "}\n");
   }
-  emitBodyLock(1, "auto runWorker = [&](int worker, int chunkBegin, int chunkEnd) {\n");
-  emitBodyLock(2, "for (int cppId = chunkBegin; cppId < chunkEnd; cppId ++) {\n");
-  emitBodyLock(3, "switch (cppId) {\n");
-  for (int cppId = 0; cppId < superId; cppId ++) {
-    if (mtTasks[cppId].taskKind != "pure_compute") continue;
-    emitBodyLock(4, "case %d:\n", cppId);
-    emitBodyLock(5, "if (workerFlags[worker] & 0x%lx) {\n", (uint64_t)1 << (cppId % ACTIVE_WIDTH));
-    emitBodyLock(6, "std::chrono::steady_clock::time_point mtProfileTaskBegin;\n");
-    emitBodyLock(6, "if (mtProfileEnabled) mtProfileTaskBegin = std::chrono::steady_clock::now();\n");
-    if (mtTasks[cppId].repcutRuntimeApplied) {
-      emitBodyLock(6, "mtRepCutLiteTask%d(workerFlags[worker], workerBuffers[worker]);\n", cppId);
-    } else {
-      emitBodyLock(6, "mtTask%d(workerFlags[worker], workerBuffers[worker]);\n", cppId);
-    }
-    emitBodyLock(6, "if (mtProfileEnabled) {\n");
-    emitBodyLock(7, "mtProfileLocalTaskExec[worker][%d] ++;\n", cppId);
-    emitBodyLock(7, "mtProfileLocalWorkerTaskCount[worker] ++;\n");
-    emitBodyLock(6, "}\n");
-    emitBodyLock(5, "}\n");
-    emitBodyLock(5, "break;\n");
-  }
-  emitBodyLock(4, "default:\n");
-  emitBodyLock(5, "break;\n");
-  emitBodyLock(3, "}\n");
-  emitBodyLock(2, "}\n");
-  emitBodyLock(1, "};\n");
   emitBodyLock(1, "if (workerCount == 1) {\n");
-  emitBodyLock(2, "runWorker(0, beginCppId, endCppId);\n");
+  emitBodyLock(2, "mtRunPureBatchWorkerRange(0, beginCppId, endCppId);\n");
+  emitBodyLock(1, "} else if (mtWorkerPoolEnabled && mtWorkerPoolThreadCount >= workerCount) {\n");
+  emitBodyLock(2, "{\n");
+  emitBodyLock(3, "std::lock_guard<std::mutex> lock(mtWorkerPoolMutex);\n");
+  if (useCoarse) {
+    emitBodyLock(3, "mtWorkerPoolJobKind = 0;\n");
+  }
+  emitBodyLock(3, "mtWorkerPoolCurrentWorkerCount = workerCount;\n");
+  emitBodyLock(3, "mtWorkerPoolDoneCount = 0;\n");
+  emitBodyLock(3, "for (int worker = 0; worker < workerCount; worker ++) {\n");
+  emitBodyLock(4, "mtWorkerPoolChunkBegin[worker] = beginCppId + (taskCount * worker) / workerCount;\n");
+  emitBodyLock(4, "mtWorkerPoolChunkEnd[worker] = beginCppId + (taskCount * (worker + 1)) / workerCount;\n");
+  emitBodyLock(3, "}\n");
+  emitBodyLock(3, "mtWorkerPoolGeneration ++;\n");
+  emitBodyLock(2, "}\n");
+  emitBodyLock(2, "mtWorkerPoolCv.notify_all();\n");
+  emitBodyLock(2, "{\n");
+  emitBodyLock(3, "std::unique_lock<std::mutex> lock(mtWorkerPoolMutex);\n");
+  emitBodyLock(3, "mtWorkerPoolDoneCv.wait(lock, [&]() { return mtWorkerPoolDoneCount >= mtWorkerPoolCurrentWorkerCount; });\n");
+  emitBodyLock(2, "}\n");
   emitBodyLock(1, "} else {\n");
   emitBodyLock(2, "std::vector<std::thread> workers;\n");
   emitBodyLock(2, "workers.reserve(workerCount);\n");
   emitBodyLock(2, "for (int worker = 0; worker < workerCount; worker ++) {\n");
   emitBodyLock(3, "int chunkBegin = beginCppId + (taskCount * worker) / workerCount;\n");
   emitBodyLock(3, "int chunkEnd = beginCppId + (taskCount * (worker + 1)) / workerCount;\n");
-  emitBodyLock(3, "workers.emplace_back([&, worker, chunkBegin, chunkEnd]() { runWorker(worker, chunkBegin, chunkEnd); });\n");
+  emitBodyLock(3, "workers.emplace_back([&, worker, chunkBegin, chunkEnd]() { mtRunPureBatchWorkerRange(worker, chunkBegin, chunkEnd); });\n");
   emitBodyLock(2, "}\n");
   emitBodyLock(2, "for (std::thread &worker : workers) worker.join();\n");
   emitBodyLock(1, "}\n");
   emitBodyLock(1, "std::chrono::steady_clock::time_point mtProfileMergeBegin;\n");
   emitBodyLock(1, "if (mtProfileEnabled) mtProfileMergeBegin = std::chrono::steady_clock::now();\n");
-  emitBodyLock(1, "for (int worker = 0; worker < workerCount; worker ++) activeWord |= workerFlags[worker];\n");
-  emitBodyLock(1, "for (int worker = 0; worker < workerCount; worker ++) workerBuffers[worker].mergeFrom(activeFlags);\n");
+  emitBodyLock(1, "for (int worker = 0; worker < workerCount; worker ++) activeWord |= mtWorkerFlags[worker];\n");
+  emitBodyLock(1, "for (int worker = 0; worker < workerCount; worker ++) mtWorkerDeltas[worker].mergeInto(activeFlags);\n");
   emitBodyLock(1, "if (mtProfileEnabled) {\n");
   emitBodyLock(2, "for (int worker = 0; worker < workerCount; worker ++) {\n");
+  emitBodyLock(3, "mtProfileActivationDeltaEntries += mtWorkerDeltas[worker].entries.size();\n");
+  emitBodyLock(3, "if (mtWorkerDeltas[worker].entries.size() > mtProfileActivationDeltaMaxEntriesPerWorker) mtProfileActivationDeltaMaxEntriesPerWorker = mtWorkerDeltas[worker].entries.size();\n");
+  emitBodyLock(3, "if (mtWorkerDeltas[worker].allActive) mtProfileActivationDeltaActivateAllCount ++;\n");
   emitBodyLock(3, "mtProfileWorkerTaskCount[(size_t)worker] += mtProfileLocalWorkerTaskCount[worker];\n");
   emitBodyLock(3, "mtProfilePureTasks += mtProfileLocalWorkerTaskCount[worker];\n");
-  emitBodyLock(3, "for (int cppId = 0; cppId < %d; cppId ++) mtProfileTaskExecCount[cppId] += mtProfileLocalTaskExec[worker][cppId];\n", superId);
+  emitBodyLock(3, "for (int cppId : mtProfileLocalTaskIds[worker]) mtProfileTaskExecCount[cppId] ++;\n");
   emitBodyLock(2, "}\n");
   emitBodyLock(1, "}\n");
   emitBodyLock(1, "if (mtProfileEnabled) mtProfileMergeWallNs += std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - mtProfileMergeBegin).count();\n");
   emitBodyLock(1, "if (mtProfileEnabled) mtProfileBatchWallNs += std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - mtProfileBatchBegin).count();\n");
+  emitBodyLock(1, "if (mtProfileEnabled) mtProfileTrueParallelWallNs += std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - mtProfileBatchBegin).count();\n");
+  emitBodyLock(0, "}\n");
+}
+
+void graph::genMtCoarseRegionRunner(const MtRepCutSemanticPlan& semanticPlan, const MtCoarseRegionPlan& coarsePlan) {
+  std::map<int, MtTaskInfo> mtTasks = buildMtTaskInfoMapWithRepCutSelection();
+  markMtRepCutLiteRuntimeApplied(mtTasks);
+
+  emitFuncDecl(0, "void S%s::mtRunCoarseLayerWorkerRange(int worker, int regionIndex, int layerIndex, int chunkBegin, int chunkEnd) {\n", name.c_str());
+  emitBodyLock(1, "if (chunkEnd <= chunkBegin) return;\n");
+  emitBodyLock(1, "switch (regionIndex) {\n");
+  int regionIndex = 0;
+  for (const MtCoarseRegion& region : coarsePlan.regions) {
+    if (!region.runtimeEligible) continue;
+    emitBodyLock(2, "case %d:\n", regionIndex);
+    emitBodyLock(3, "switch (layerIndex) {\n");
+    for (size_t layerIdx = 0; layerIdx < region.layers.size(); layerIdx ++) {
+      const MtCoarseLayer& layer = region.layers[layerIdx];
+      emitBodyLock(4, "case %zu:\n", layerIdx);
+      emitBodyLock(5, "for (int localIndex = chunkBegin; localIndex < chunkEnd; localIndex ++) {\n");
+      emitBodyLock(6, "switch (localIndex) {\n");
+      for (size_t localIndex = 0; localIndex < layer.taskCppIds.size(); localIndex ++) {
+        int cppId = layer.taskCppIds[localIndex];
+        int wordOffset = cppId / ACTIVE_WIDTH - region.beginActiveWord;
+        uint64_t mask = (uint64_t)1 << (cppId % ACTIVE_WIDTH);
+        emitBodyLock(7, "case %zu:\n", localIndex);
+        emitBodyLock(8, "if (mtWorkerCoarseFlags[worker][%d] & 0x%lx) {\n", wordOffset, mask);
+        if (mtTasks[cppId].repcutRuntimeApplied) {
+          emitBodyLock(9, "mtRepCutLiteTask%d(mtWorkerCoarseFlags[worker][%d], mtWorkerDeltas[worker]);\n", cppId, wordOffset);
+        } else {
+          emitBodyLock(9, "mtTask%d(mtWorkerCoarseFlags[worker][%d], mtWorkerDeltas[worker]);\n", cppId, wordOffset);
+        }
+        emitBodyLock(9, "if (mtProfileEnabled) {\n");
+        emitBodyLock(10, "mtProfileLocalTaskIds[worker].push_back(%d);\n", cppId);
+        emitBodyLock(10, "mtProfileLocalWorkerTaskCount[worker] ++;\n");
+        emitBodyLock(9, "}\n");
+        emitBodyLock(8, "}\n");
+        emitBodyLock(8, "break;\n");
+      }
+      emitBodyLock(7, "default:\n");
+      emitBodyLock(8, "break;\n");
+      emitBodyLock(6, "}\n");
+      emitBodyLock(5, "}\n");
+      emitBodyLock(5, "break;\n");
+    }
+    emitBodyLock(4, "default:\n");
+    emitBodyLock(5, "break;\n");
+    emitBodyLock(3, "}\n");
+    emitBodyLock(3, "break;\n");
+    regionIndex ++;
+  }
+  emitBodyLock(2, "default:\n");
+  emitBodyLock(3, "break;\n");
+  emitBodyLock(1, "}\n");
+  emitBodyLock(0, "}\n");
+
+  emitFuncDecl(0, "void S%s::mtRunCoarseRegion(int regionIndex, uint%d_t *coarseActiveWords) {\n", name.c_str(), ACTIVE_WIDTH);
+  emitBodyLock(1, "std::chrono::steady_clock::time_point mtProfileBatchBegin;\n");
+  emitBodyLock(1, "if (mtProfileEnabled) mtProfileBatchBegin = std::chrono::steady_clock::now();\n");
+  emitBodyLock(1, "int regionTaskCount = 0;\n");
+  emitBodyLock(1, "int regionBeginActiveWord = 0;\n");
+  emitBodyLock(1, "int regionActiveWordSpan = 0;\n");
+  emitBodyLock(1, "int regionLayerCount = 0;\n");
+  emitBodyLock(1, "int regionMemberNodeCount = 0;\n");
+  emitBodyLock(1, "switch (regionIndex) {\n");
+  regionIndex = 0;
+  for (const MtCoarseRegion& region : coarsePlan.regions) {
+    if (!region.runtimeEligible) continue;
+    emitBodyLock(2, "case %d:\n", regionIndex);
+    emitBodyLock(3, "regionTaskCount = %d;\n", region.taskCount);
+    emitBodyLock(3, "regionBeginActiveWord = %d;\n", region.beginActiveWord);
+    emitBodyLock(3, "regionActiveWordSpan = %d;\n", region.activeWordSpan);
+    emitBodyLock(3, "regionLayerCount = %d;\n", region.estimatedLayerCount);
+    emitBodyLock(3, "regionMemberNodeCount = %d;\n", region.memberNodeCost);
+    emitBodyLock(3, "break;\n");
+    regionIndex ++;
+  }
+  emitBodyLock(2, "default:\n");
+  emitBodyLock(3, "return;\n");
+  emitBodyLock(1, "}\n");
+  emitBodyLock(1, "int workerCount = mtConfiguredWorkerCount;\n");
+  emitBodyLock(1, "if (workerCount > regionTaskCount) workerCount = regionTaskCount;\n");
+  emitBodyLock(1, "if (workerCount < 2) workerCount = 1;\n");
+  emitBodyLock(1, "if (mtProfileEnabled) {\n");
+  emitBodyLock(2, "int batchSizeBucket = regionTaskCount <= 1 ? 0 : (regionTaskCount == 2 ? 1 : (regionTaskCount <= 4 ? 2 : (regionTaskCount <= 8 ? 3 : (regionTaskCount <= 15 ? 4 : 5))));\n");
+  emitBodyLock(2, "mtProfileBatchSizeHist[batchSizeBucket] ++;\n");
+  emitBodyLock(2, "mtProfilePureBatchCount ++;\n");
+  emitBodyLock(2, "mtProfileBatchMemberNodeCount += regionMemberNodeCount;\n");
+  emitBodyLock(1, "}\n");
+  emitBodyLock(1, "if (mtProfileEnabled && mtProfileWorkerTaskCount.size() < (size_t)workerCount) mtProfileWorkerTaskCount.resize((size_t)workerCount, 0);\n");
+  emitBodyLock(1, "if (workerCount == 1) {\n");
+  emitBodyLock(2, "if (mtProfileEnabled) {\n");
+  emitBodyLock(3, "mtProfileSkippedFakeParallelBatchCount ++;\n");
+  emitBodyLock(3, "if (mtProfileEffectiveWorkerCountHist.size() <= 1) mtProfileEffectiveWorkerCountHist.resize(2, 0);\n");
+  emitBodyLock(3, "mtProfileEffectiveWorkerCountHist[1] ++;\n");
+  emitBodyLock(3, "mtProfileRejectConfiguredSingleWorker ++;\n");
+  emitBodyLock(2, "}\n");
+  emitBodyLock(1, "} else if (mtProfileEnabled) {\n");
+  emitBodyLock(2, "mtProfileTrueParallelBatchCount ++;\n");
+  emitBodyLock(2, "if (workerCount > mtProfileMaxWorkerCount) mtProfileMaxWorkerCount = workerCount;\n");
+  emitBodyLock(2, "if (mtProfileEffectiveWorkerCountHist.size() <= (size_t)workerCount) mtProfileEffectiveWorkerCountHist.resize((size_t)workerCount + 1, 0);\n");
+  emitBodyLock(2, "mtProfileEffectiveWorkerCountHist[(size_t)workerCount] ++;\n");
+  emitBodyLock(1, "}\n");
+  emitBodyLock(1, "if (mtWorkerDeltas.size() < (size_t)workerCount) mtWorkerDeltas.resize((size_t)workerCount);\n");
+  emitBodyLock(1, "if (mtWorkerCoarseFlags.size() < (size_t)workerCount) mtWorkerCoarseFlags.resize((size_t)workerCount);\n");
+  emitBodyLock(1, "if (mtProfileEnabled) {\n");
+  emitBodyLock(2, "mtProfileLocalWorkerTaskCount.assign((size_t)workerCount, 0);\n");
+  emitBodyLock(2, "mtProfileLocalTaskIds.clear();\n");
+  emitBodyLock(2, "mtProfileLocalTaskIds.resize((size_t)workerCount);\n");
+  emitBodyLock(1, "}\n");
+  emitBodyLock(1, "for (int layer = 0; layer < regionLayerCount; layer ++) {\n");
+  emitBodyLock(2, "for (int worker = 0; worker < workerCount; worker ++) {\n");
+  emitBodyLock(3, "mtWorkerDeltas[worker].clear();\n");
+  emitBodyLock(3, "mtWorkerCoarseFlags[worker].assign(coarseActiveWords, coarseActiveWords + regionActiveWordSpan);\n");
+  emitBodyLock(2, "}\n");
+  emitBodyLock(2, "int layerTaskCount = 0;\n");
+  emitBodyLock(2, "switch (regionIndex) {\n");
+  regionIndex = 0;
+  for (const MtCoarseRegion& region : coarsePlan.regions) {
+    if (!region.runtimeEligible) continue;
+    emitBodyLock(3, "case %d:\n", regionIndex);
+    emitBodyLock(4, "switch (layer) {\n");
+    for (size_t layerIdx = 0; layerIdx < region.layers.size(); layerIdx ++) {
+      emitBodyLock(5, "case %zu: layerTaskCount = %zu; break;\n", layerIdx, region.layers[layerIdx].taskCppIds.size());
+    }
+    emitBodyLock(5, "default: layerTaskCount = 0; break;\n");
+    emitBodyLock(4, "}\n");
+    emitBodyLock(4, "break;\n");
+    regionIndex ++;
+  }
+  emitBodyLock(3, "default:\n");
+  emitBodyLock(4, "layerTaskCount = 0;\n");
+  emitBodyLock(4, "break;\n");
+  emitBodyLock(2, "}\n");
+  emitBodyLock(2, "if (layerTaskCount <= 0) continue;\n");
+  emitBodyLock(2, "int layerWorkerCount = workerCount;\n");
+  emitBodyLock(2, "if (layerWorkerCount > layerTaskCount) layerWorkerCount = layerTaskCount;\n");
+  emitBodyLock(2, "if (layerWorkerCount < 1) layerWorkerCount = 1;\n");
+  emitBodyLock(2, "if (layerWorkerCount == 1) {\n");
+  emitBodyLock(3, "mtRunCoarseLayerWorkerRange(0, regionIndex, layer, 0, layerTaskCount);\n");
+  emitBodyLock(2, "} else if (mtWorkerPoolEnabled && mtWorkerPoolThreadCount >= layerWorkerCount) {\n");
+  emitBodyLock(3, "{\n");
+  emitBodyLock(4, "std::lock_guard<std::mutex> lock(mtWorkerPoolMutex);\n");
+  emitBodyLock(4, "mtWorkerPoolJobKind = 1;\n");
+  emitBodyLock(4, "mtWorkerPoolCoarseRegionIndex = regionIndex;\n");
+  emitBodyLock(4, "mtWorkerPoolCoarseLayerIndex = layer;\n");
+  emitBodyLock(4, "mtWorkerPoolCurrentWorkerCount = layerWorkerCount;\n");
+  emitBodyLock(4, "mtWorkerPoolDoneCount = 0;\n");
+  emitBodyLock(4, "for (int worker = 0; worker < layerWorkerCount; worker ++) {\n");
+  emitBodyLock(5, "mtWorkerPoolChunkBegin[worker] = (layerTaskCount * worker) / layerWorkerCount;\n");
+  emitBodyLock(5, "mtWorkerPoolChunkEnd[worker] = (layerTaskCount * (worker + 1)) / layerWorkerCount;\n");
+  emitBodyLock(4, "}\n");
+  emitBodyLock(4, "mtWorkerPoolGeneration ++;\n");
+  emitBodyLock(3, "}\n");
+  emitBodyLock(3, "mtWorkerPoolCv.notify_all();\n");
+  emitBodyLock(3, "{\n");
+  emitBodyLock(4, "std::unique_lock<std::mutex> lock(mtWorkerPoolMutex);\n");
+  emitBodyLock(4, "mtWorkerPoolDoneCv.wait(lock, [&]() { return mtWorkerPoolDoneCount >= mtWorkerPoolCurrentWorkerCount; });\n");
+  emitBodyLock(3, "}\n");
+  emitBodyLock(2, "} else {\n");
+  emitBodyLock(3, "std::vector<std::thread> workers;\n");
+  emitBodyLock(3, "workers.reserve(layerWorkerCount);\n");
+  emitBodyLock(3, "for (int worker = 0; worker < layerWorkerCount; worker ++) {\n");
+  emitBodyLock(4, "int chunkBegin = (layerTaskCount * worker) / layerWorkerCount;\n");
+  emitBodyLock(4, "int chunkEnd = (layerTaskCount * (worker + 1)) / layerWorkerCount;\n");
+  emitBodyLock(4, "workers.emplace_back([&, worker, chunkBegin, chunkEnd]() { mtRunCoarseLayerWorkerRange(worker, regionIndex, layer, chunkBegin, chunkEnd); });\n");
+  emitBodyLock(3, "}\n");
+  emitBodyLock(3, "for (std::thread &worker : workers) worker.join();\n");
+  emitBodyLock(2, "}\n");
+  emitBodyLock(2, "std::chrono::steady_clock::time_point mtProfileMergeBegin;\n");
+  emitBodyLock(2, "if (mtProfileEnabled) mtProfileMergeBegin = std::chrono::steady_clock::now();\n");
+  emitBodyLock(2, "for (int worker = 0; worker < layerWorkerCount; worker ++) {\n");
+  emitBodyLock(3, "for (int word = 0; word < regionActiveWordSpan; word ++) coarseActiveWords[word] |= mtWorkerCoarseFlags[worker][word];\n");
+  emitBodyLock(3, "for (const ActivationDeltaEntry &entry : mtWorkerDeltas[worker].entries) {\n");
+  emitBodyLock(4, "int localWord = entry.idx - regionBeginActiveWord;\n");
+  emitBodyLock(4, "if (localWord >= 0 && localWord < regionActiveWordSpan) coarseActiveWords[localWord] |= (uint%d_t)entry.mask;\n", ACTIVE_WIDTH);
+  emitBodyLock(4, "else activeFlags[entry.idx] |= (uint%d_t)entry.mask;\n", ACTIVE_WIDTH);
+  emitBodyLock(3, "}\n");
+  emitBodyLock(3, "if (mtWorkerDeltas[worker].allActive) {\n");
+  emitBodyLock(4, "for (int word = 0; word < regionActiveWordSpan; word ++) coarseActiveWords[word] = (uint%d_t)-1;\n", ACTIVE_WIDTH);
+  emitBodyLock(4, "for (int word = 0; word < %d; word ++) activeFlags[word] = (uint%d_t)-1;\n", activeFlagNum, ACTIVE_WIDTH);
+  emitBodyLock(3, "}\n");
+  emitBodyLock(2, "}\n");
+  emitBodyLock(2, "if (mtProfileEnabled) {\n");
+  emitBodyLock(3, "for (int worker = 0; worker < layerWorkerCount; worker ++) {\n");
+  emitBodyLock(4, "mtProfileActivationDeltaEntries += mtWorkerDeltas[worker].entries.size();\n");
+  emitBodyLock(4, "if (mtWorkerDeltas[worker].entries.size() > mtProfileActivationDeltaMaxEntriesPerWorker) mtProfileActivationDeltaMaxEntriesPerWorker = mtWorkerDeltas[worker].entries.size();\n");
+  emitBodyLock(4, "if (mtWorkerDeltas[worker].allActive) mtProfileActivationDeltaActivateAllCount ++;\n");
+  emitBodyLock(4, "mtProfileWorkerTaskCount[(size_t)worker] += mtProfileLocalWorkerTaskCount[worker];\n");
+  emitBodyLock(4, "mtProfilePureTasks += mtProfileLocalWorkerTaskCount[worker];\n");
+  emitBodyLock(4, "for (int cppId : mtProfileLocalTaskIds[worker]) mtProfileTaskExecCount[cppId] ++;\n");
+  emitBodyLock(3, "}\n");
+  emitBodyLock(2, "}\n");
+  emitBodyLock(2, "if (mtProfileEnabled) mtProfileMergeWallNs += std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - mtProfileMergeBegin).count();\n");
+  emitBodyLock(2, "if (mtProfileEnabled) {\n");
+  emitBodyLock(3, "for (int worker = 0; worker < workerCount; worker ++) {\n");
+  emitBodyLock(4, "mtProfileLocalWorkerTaskCount[worker] = 0;\n");
+  emitBodyLock(4, "mtProfileLocalTaskIds[worker].clear();\n");
+  emitBodyLock(3, "}\n");
+  emitBodyLock(2, "}\n");
+  emitBodyLock(1, "}\n");
+  emitBodyLock(1, "if (mtProfileEnabled) mtProfileBatchWallNs += std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - mtProfileBatchBegin).count();\n");
+  emitBodyLock(1, "if (mtProfileEnabled && workerCount > 1) mtProfileTrueParallelWallNs += std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - mtProfileBatchBegin).count();\n");
   emitBodyLock(0, "}\n");
 }
 
 int graph::genActivateSeqHelpers(bool buffered) {
     std::map<int, MtTaskInfo> mtTasks = buildMtTaskInfoMapWithRepCut();
     for (int idx = 0; idx < superId; idx ++) {
-      genMtTaskHelper(cppId2Super[idx], buffered);
+      genMtTaskHelper(cppId2Super[idx], buffered, "ActiveBuffer");
     }
 
     emitFuncDecl(0, "void S%s::subStep0() {\n", name.c_str());
@@ -2128,18 +3375,32 @@ int graph::genActivateMtHelpers() {
     std::map<int, MtTaskInfo> mtTasks = buildMtTaskInfoMapWithRepCutSelection();
     markMtRepCutLiteRuntimeApplied(mtTasks);
     MtRepCutSemanticPlan semanticPlan = planMtRepCutSemantics(mtTasks);
+    MtCoarseRegionPlan coarsePlan = planMtCoarseRegions(mtTasks);
     MtPureBatchPlan batchPlan = semanticPlan.batchPlan;
     std::map<int, int> batchEndByStart;
     for (auto batch : batchPlan.batches) {
       batchEndByStart[batch.first] = batch.second;
     }
-    for (int idx = 0; idx < superId; idx ++) {
-      genMtTaskHelper(cppId2Super[idx], true);
+    std::map<int, int> coarseRegionIndexByStart;
+    std::map<int, MtCoarseRegion> coarseRegionByStart;
+    if (globalConfig.MtBatchFormationMode == "coarse") {
+      int regionIndex = 0;
+      for (const MtCoarseRegion& region : coarsePlan.regions) {
+        if (!region.runtimeEligible) continue;
+        coarseRegionIndexByStart[region.beginCppId] = regionIndex;
+        coarseRegionByStart[region.beginCppId] = region;
+        regionIndex ++;
+      }
     }
     for (int idx = 0; idx < superId; idx ++) {
-      if (mtTasks[idx].repcutRuntimeApplied) genMtRepCutLiteTaskHelper(cppId2Super[idx], mtRepCutClonesForSink(semanticPlan, idx));
+      genMtTaskHelper(cppId2Super[idx], true, "ActivationDelta");
+      genMtTaskHelper(cppId2Super[idx], false, "ActivationDelta");
+    }
+    for (int idx = 0; idx < superId; idx ++) {
+      if (mtTasks[idx].repcutRuntimeApplied) genMtRepCutLiteTaskHelper(cppId2Super[idx], mtRepCutClonesForSink(semanticPlan, idx), "ActivationDelta");
     }
     genMtTaskRunner(semanticPlan);
+    if (globalConfig.MtBatchFormationMode == "coarse") genMtCoarseRegionRunner(semanticPlan, coarsePlan);
 
     emitFuncDecl(0, "void S%s::subStep0() {\n", name.c_str());
     int indent = 1;
@@ -2151,6 +3412,35 @@ int graph::genActivateMtHelpers() {
       uint64_t mask;
       std::tie(id, mask) = setIdxMask(idx);
       int offset = idx % ACTIVE_WIDTH;
+      auto coarseIter = coarseRegionIndexByStart.find(idx);
+      if (coarseIter != coarseRegionIndexByStart.end()) {
+        const MtCoarseRegion& region = coarseRegionByStart[idx];
+        if (prevActiveWhole) emitBodyLock(--indent, "}\n");
+        prevActiveWhole = false;
+        emitBodyLock(indent, "uint%d_t mtCoarseWords%d[%d];\n", ACTIVE_WIDTH, idx, region.activeWordSpan);
+        std::string coarseGuard;
+        for (int word = 0; word < region.activeWordSpan; word ++) {
+          int activeWord = region.beginActiveWord + word;
+          emitBodyLock(indent, "mtCoarseWords%d[%d] = activeFlags[%d];\n", idx, word, activeWord);
+          emitBodyLock(indent, "activeFlags[%d] = 0;\n", activeWord);
+          if (!coarseGuard.empty()) coarseGuard += " | ";
+          coarseGuard += format("mtCoarseWords%d[%d]", idx, word);
+        }
+        emitBodyLock(indent ++, "if(unlikely((%s) != 0)) {\n", coarseGuard.c_str());
+        emitBodyLock(indent, "if (mtProfileEnabled) {\n");
+        for (int word = 0; word < region.activeWordSpan; word ++) {
+          emitBodyLock(indent + 1, "if (mtCoarseWords%d[%d] != 0) mtProfileActiveWordCount ++;\n", idx, word);
+        }
+        emitBodyLock(indent, "}\n");
+        emitBodyLock(indent, "mtRunCoarseRegion(%d, mtCoarseWords%d);\n", coarseIter->second, idx);
+        emitBodyLock(--indent, "}\n");
+        for (int word = 0; word < region.activeWordSpan; word ++) {
+          int activeWord = region.beginActiveWord + word;
+          emitBodyLock(indent, "activeFlags[%d] |= mtCoarseWords%d[%d];\n", activeWord, idx, word);
+        }
+        idx = region.endCppId - 1;
+        continue;
+      }
       if (offset == 0) {
         if (prevActiveWhole) {
           emitBodyLock(--indent, "}\n");
@@ -2186,14 +3476,29 @@ int graph::genActivateMtHelpers() {
       std::string flagName = prevActiveWhole ? "oldFlag" : format("activeWord%d", id);
       indent = genNodeStepStart(super, mask, idx, flagName, indent);
       emitBodyLock(indent ++, "{\n");
-      emitBodyLock(indent, "ActiveBuffer mtBuffer;\n");
-      emitBodyLock(indent, "mtBuffer.clear();\n");
-      emitBodyLock(indent, "std::chrono::steady_clock::time_point mtProfileTaskBegin;\n");
-      emitBodyLock(indent, "if (mtProfileEnabled) mtProfileTaskBegin = std::chrono::steady_clock::now();\n");
-      emitBodyLock(indent, "mtTask%d(%s, mtBuffer);\n", idx, flagName.c_str());
-      emitBodyLock(indent, "recordMtProfileTask(%d, %s, mtProfileEnabled ? std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - mtProfileTaskBegin).count() : 0);\n",
+      emitBodyLock(indent, "if (mtProfileEnabled) {\n");
+      emitBodyLock(indent + 1, "if (mtProfileEffectiveWorkerCountHist.size() <= 1) mtProfileEffectiveWorkerCountHist.resize(2, 0);\n");
+      emitBodyLock(indent + 1, "mtProfileEffectiveWorkerCountHist[1] ++;\n");
+      if (!prevActiveWhole) {
+        emitBodyLock(indent + 1, "mtProfileRejectNotActiveWhole ++;\n");
+      } else if (isAlwaysActive(idx)) {
+        emitBodyLock(indent + 1, "mtProfileRejectAlwaysActiveTask ++;\n");
+      } else if (mtTasks[idx].taskKind != "pure_compute") {
+        emitBodyLock(indent + 1, "mtProfileRejectSerialTask ++;\n");
+      } else if (mtTaskHasSameActiveWordHazard(mtTasks, idx, globalConfig.MtRepCutLiteMode == "on")) {
+        emitBodyLock(indent + 1, "mtProfileRejectSameActiveWordHazard ++;\n");
+      } else {
+        emitBodyLock(indent + 1, "mtProfileRejectBelowMinBatch ++;\n");
+      }
+      emitBodyLock(indent, "}\n");
+      emitBodyLock(indent, "if (mtProfileEnabled) {\n");
+      emitBodyLock(indent + 1, "std::chrono::steady_clock::time_point mtProfileTaskBegin = std::chrono::steady_clock::now();\n");
+      emitBodyLock(indent + 1, "mtTask%d(%s);\n", idx, flagName.c_str());
+      emitBodyLock(indent + 1, "recordMtProfileTask(%d, %s, std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - mtProfileTaskBegin).count());\n",
                    idx, mtTasks[idx].taskKind == "pure_compute" ? "true" : "false");
-      emitBodyLock(indent, "mtBuffer.mergeFrom(activeFlags);\n");
+      emitBodyLock(indent, "} else {\n");
+      emitBodyLock(indent + 1, "mtTask%d(%s);\n", idx, flagName.c_str());
+      emitBodyLock(indent, "}\n");
       emitBodyLock(-- indent, "}\n");
       indent = genNodeStepEnd(super, indent);
     }
@@ -2204,7 +3509,8 @@ int graph::genActivateMtHelpers() {
 }
 
 void graph::genResetDef(SuperNode* super, bool isUIntReset, bool buffered, int resetId, int indent) {
-  if (buffered) emitBodyLock(indent ++, "void S%s::subReset%d(ActiveBuffer &nextActive){ // %s reset\n", name.c_str(), resetId, isUIntReset ? "uint" : "async");
+  std::string activeSinkType = globalConfig.MtHelperMode == "mt" ? "ActivationDelta" : "ActiveBuffer";
+  if (buffered) emitBodyLock(indent ++, "void S%s::subReset%d(%s &nextActive){ // %s reset\n", name.c_str(), resetId, activeSinkType.c_str(), isUIntReset ? "uint" : "async");
   else emitBodyLock(indent ++, "void S%s::subReset%d(){ // %s reset\n", name.c_str(), resetId, isUIntReset ? "uint" : "async");
   std::string resetName = super->resetNode->type == NODE_REG_SRC ? RESET_NAME(super->resetNode).c_str() : super->resetNode->name.c_str();
   emitBodyLock(indent ++, "if(unlikely(%s)) {\n", resetName.c_str());
@@ -2395,6 +3701,7 @@ void graph::cppEmitter() {
   }
   if (globalConfig.DumpMtScheduleJson) dumpMtScheduleJson();
   if (globalConfig.DumpMtRepCutLiteReport || globalConfig.MtRepCutLiteMode == "on") dumpMtRepCutLiteReport();
+  if (globalConfig.DumpMtCoarseRegionReport || globalConfig.MtBatchFormationMode == "coarse") dumpMtCoarseRegionReport();
 
   srcFp = NULL;
   srcFileIdx = 0;
@@ -2410,12 +3717,14 @@ void graph::cppEmitter() {
                        globalConfig.MtHelperMode == "buffered-seq";
   bool useBufferedHelpers = globalConfig.MtHelperMode == "buffered-seq" || useMtHelpers;
   bool useHelperTasks = useSeqHelpers || useMtHelpers;
+  bool useCoarseMt = useMtHelpers && globalConfig.MtBatchFormationMode == "coarse";
   std::map<int, MtTaskInfo> mtRepCutHeaderTasks;
   if (useMtHelpers) {
     mtRepCutHeaderTasks = buildMtTaskInfoMapWithRepCutSelection();
     markMtRepCutLiteRuntimeApplied(mtRepCutHeaderTasks);
   }
-  if (useBufferedHelpers) emitActiveBufferDef(header, activeFlagNum);
+  if (globalConfig.MtHelperMode == "buffered-seq") emitActiveBufferDef(header, activeFlagNum);
+  if (useMtHelpers) emitActivationDeltaDef(header, activeFlagNum);
 
   fprintf(header, "class S%s {\npublic:\n", name.c_str());
   fprintf(header, "uint64_t cycles;\n");
@@ -2431,12 +3740,55 @@ void graph::cppEmitter() {
   fprintf(header, "uint64_t mtProfileSerialTasks;\n");
   fprintf(header, "uint64_t mtProfilePureTasks;\n");
   fprintf(header, "uint64_t mtProfilePureBatchCount;\n");
+  fprintf(header, "uint64_t mtProfileTrueParallelBatchCount;\n");
+  fprintf(header, "uint64_t mtProfileSkippedFakeParallelBatchCount;\n");
+  fprintf(header, "uint64_t mtProfileSerialFastTaskCount;\n");
+  fprintf(header, "uint64_t mtProfileActivationDeltaEntries;\n");
+  fprintf(header, "uint64_t mtProfileActivationDeltaMaxEntriesPerWorker;\n");
+  fprintf(header, "uint64_t mtProfileActivationDeltaActivateAllCount;\n");
+  fprintf(header, "uint64_t mtProfileRejectNotActiveWhole;\n");
+  fprintf(header, "uint64_t mtProfileRejectAlwaysActiveTask;\n");
+  fprintf(header, "uint64_t mtProfileRejectSerialTask;\n");
+  fprintf(header, "uint64_t mtProfileRejectDependencyEdge;\n");
+  fprintf(header, "uint64_t mtProfileRejectSameActiveWordHazard;\n");
+  fprintf(header, "uint64_t mtProfileRejectBelowMinBatch;\n");
+  fprintf(header, "uint64_t mtProfileRejectConfiguredSingleWorker;\n");
+  fprintf(header, "uint64_t mtProfileBatchMemberNodeCount;\n");
+  fprintf(header, "uint64_t mtProfileSameActiveWordForwardEdges;\n");
+  fprintf(header, "uint64_t mtProfileCrossBatchActivationFanout;\n");
   fprintf(header, "uint64_t mtProfileBatchWallNs;\n");
+  fprintf(header, "uint64_t mtProfileTrueParallelWallNs;\n");
   fprintf(header, "uint64_t mtProfileSerialWallNs;\n");
   fprintf(header, "uint64_t mtProfileMergeWallNs;\n");
   fprintf(header, "uint64_t mtProfileTotalStepNs;\n");
   fprintf(header, "uint64_t mtProfileTaskExecCount[%d];\n", superId);
   fprintf(header, "std::vector<uint64_t> mtProfileWorkerTaskCount;\n");
+  fprintf(header, "uint64_t mtProfileBatchSizeHist[6];\n");
+  fprintf(header, "std::vector<uint64_t> mtProfileEffectiveWorkerCountHist;\n");
+  if (useMtHelpers) {
+    fprintf(header, "std::vector<ActivationDelta> mtWorkerDeltas;\n");
+    fprintf(header, "std::vector<uint%d_t> mtWorkerFlags;\n", ACTIVE_WIDTH);
+    if (useCoarseMt) {
+      fprintf(header, "std::vector<std::vector<uint%d_t>> mtWorkerCoarseFlags;\n", ACTIVE_WIDTH);
+      fprintf(header, "int mtWorkerPoolJobKind;\n");
+      fprintf(header, "int mtWorkerPoolCoarseRegionIndex;\n");
+      fprintf(header, "int mtWorkerPoolCoarseLayerIndex;\n");
+    }
+    fprintf(header, "bool mtWorkerPoolEnabled;\n");
+    fprintf(header, "int mtWorkerPoolThreadCount;\n");
+    fprintf(header, "std::vector<std::thread> mtWorkerPoolThreads;\n");
+    fprintf(header, "std::mutex mtWorkerPoolMutex;\n");
+    fprintf(header, "std::condition_variable mtWorkerPoolCv;\n");
+    fprintf(header, "std::condition_variable mtWorkerPoolDoneCv;\n");
+    fprintf(header, "uint64_t mtWorkerPoolGeneration;\n");
+    fprintf(header, "bool mtWorkerPoolStop;\n");
+    fprintf(header, "int mtWorkerPoolDoneCount;\n");
+    fprintf(header, "std::vector<int> mtWorkerPoolChunkBegin;\n");
+    fprintf(header, "std::vector<int> mtWorkerPoolChunkEnd;\n");
+    fprintf(header, "int mtWorkerPoolCurrentWorkerCount;\n");
+    fprintf(header, "std::vector<std::vector<int>> mtProfileLocalTaskIds;\n");
+    fprintf(header, "std::vector<uint64_t> mtProfileLocalWorkerTaskCount;\n");
+  }
 #ifdef PERF
   fprintf(header, "size_t activeTimes[%d];\n", superId);
 #if ENABLE_ACTIVATOR
@@ -2447,13 +3799,14 @@ void graph::cppEmitter() {
 #endif
   emitPrintf();
   /* constrcutor */
-  emitFuncDecl(0, "S%s::S%s() {\n"
-               "  cycles = 0;\n"
-               "  LOG_START = 1;\n"
-               "  LOG_END = 0;\n"
-               "  initMtProfile();\n"
-               "  init();\n"
-               "}\n", name.c_str(), name.c_str());
+  emitFuncDecl(0, "S%s::S%s() {\n", name.c_str(), name.c_str());
+  emitBodyLock(1, "cycles = 0;\n");
+  emitBodyLock(1, "LOG_START = 1;\n");
+  emitBodyLock(1, "LOG_END = 0;\n");
+  emitBodyLock(1, "initMtProfile();\n");
+  if (useMtHelpers) emitBodyLock(1, "startMtWorkerPool();\n");
+  emitBodyLock(1, "init();\n");
+  emitBodyLock(0, "}\n");
 
   /* initialization */
   emitFuncDecl(0, "void S%s::init() {\n", name.c_str());
@@ -2520,7 +3873,7 @@ void graph::cppEmitter() {
   emitBodyLock(1, "const char *threadsEnv = getenv(\"GSIM_THREADS\");\n");
   emitBodyLock(1, "mtConfiguredWorkerCount = threadsEnv == nullptr ? 1 : atoi(threadsEnv);\n");
   emitBodyLock(1, "if (mtConfiguredWorkerCount < 1) mtConfiguredWorkerCount = 1;\n");
-  emitBodyLock(1, "int mtMinBatchTasks = 16;\n");
+  emitBodyLock(1, "int mtMinBatchTasks = %d;\n", globalConfig.MtBatchFormationMode == "active-frequency" ? 2 : 16);
   emitBodyLock(1, "const char *minBatchEnv = getenv(\"GSIM_MT_MIN_BATCH_TASKS\");\n");
   emitBodyLock(1, "if (minBatchEnv != nullptr) mtMinBatchTasks = atoi(minBatchEnv);\n");
   emitBodyLock(1, "if (mtMinBatchTasks < 1) mtMinBatchTasks = 1;\n");
@@ -2531,15 +3884,49 @@ void graph::cppEmitter() {
   emitBodyLock(1, "mtProfileSerialTasks = 0;\n");
   emitBodyLock(1, "mtProfilePureTasks = 0;\n");
   emitBodyLock(1, "mtProfilePureBatchCount = 0;\n");
+  emitBodyLock(1, "mtProfileTrueParallelBatchCount = 0;\n");
+  emitBodyLock(1, "mtProfileSkippedFakeParallelBatchCount = 0;\n");
+  emitBodyLock(1, "mtProfileSerialFastTaskCount = 0;\n");
+  emitBodyLock(1, "mtProfileActivationDeltaEntries = 0;\n");
+  emitBodyLock(1, "mtProfileActivationDeltaMaxEntriesPerWorker = 0;\n");
+  emitBodyLock(1, "mtProfileActivationDeltaActivateAllCount = 0;\n");
+  emitBodyLock(1, "mtProfileRejectNotActiveWhole = 0;\n");
+  emitBodyLock(1, "mtProfileRejectAlwaysActiveTask = 0;\n");
+  emitBodyLock(1, "mtProfileRejectSerialTask = 0;\n");
+  emitBodyLock(1, "mtProfileRejectDependencyEdge = 0;\n");
+  emitBodyLock(1, "mtProfileRejectSameActiveWordHazard = 0;\n");
+  emitBodyLock(1, "mtProfileRejectBelowMinBatch = 0;\n");
+  emitBodyLock(1, "mtProfileRejectConfiguredSingleWorker = 0;\n");
+  emitBodyLock(1, "mtProfileBatchMemberNodeCount = 0;\n");
+  emitBodyLock(1, "mtProfileSameActiveWordForwardEdges = 0;\n");
+  emitBodyLock(1, "mtProfileCrossBatchActivationFanout = 0;\n");
   emitBodyLock(1, "mtProfileBatchWallNs = 0;\n");
+  emitBodyLock(1, "mtProfileTrueParallelWallNs = 0;\n");
   emitBodyLock(1, "mtProfileSerialWallNs = 0;\n");
   emitBodyLock(1, "mtProfileMergeWallNs = 0;\n");
   emitBodyLock(1, "mtProfileTotalStepNs = 0;\n");
   emitBodyLock(1, "for (int i = 0; i < %d; i ++) mtProfileTaskExecCount[i] = 0;\n", superId);
+  emitBodyLock(1, "for (int i = 0; i < 6; i ++) mtProfileBatchSizeHist[i] = 0;\n");
   emitBodyLock(1, "mtProfileWorkerTaskCount.assign((size_t)mtProfileConfiguredWorkerCount, 0);\n");
+  emitBodyLock(1, "mtProfileEffectiveWorkerCountHist.assign((size_t)mtProfileConfiguredWorkerCount + 1, 0);\n");
+  if (useMtHelpers) {
+    emitBodyLock(1, "const char *workerPoolEnv = getenv(\"GSIM_MT_WORKER_POOL\");\n");
+    emitBodyLock(1, "mtWorkerPoolEnabled = workerPoolEnv != nullptr && workerPoolEnv[0] != '\\0' && workerPoolEnv[0] != '0';\n");
+    emitBodyLock(1, "mtWorkerPoolThreadCount = 0;\n");
+    emitBodyLock(1, "mtWorkerPoolGeneration = 0;\n");
+    emitBodyLock(1, "mtWorkerPoolStop = false;\n");
+    emitBodyLock(1, "mtWorkerPoolDoneCount = 0;\n");
+    emitBodyLock(1, "mtWorkerPoolCurrentWorkerCount = 0;\n");
+    if (useCoarseMt) {
+      emitBodyLock(1, "mtWorkerPoolJobKind = 0;\n");
+      emitBodyLock(1, "mtWorkerPoolCoarseRegionIndex = -1;\n");
+      emitBodyLock(1, "mtWorkerPoolCoarseLayerIndex = -1;\n");
+    }
+  }
   emitBodyLock(0, "}\n");
 
   emitFuncDecl(0, "S%s::~S%s() {\n", name.c_str(), name.c_str());
+  if (useMtHelpers) emitBodyLock(1, "stopMtWorkerPool();\n");
   emitBodyLock(1, "dumpMtProfile();\n");
   emitBodyLock(0, "}\n");
 
@@ -2548,7 +3935,8 @@ void graph::cppEmitter() {
   emitBodyLock(1, "if (cppId >= 0 && cppId < %d) mtProfileTaskExecCount[cppId] ++;\n", superId);
   emitBodyLock(1, "if (pureTask) mtProfilePureTasks ++;\n");
   emitBodyLock(1, "else mtProfileSerialTasks ++;\n");
-  emitBodyLock(1, "if (!pureTask) mtProfileSerialWallNs += elapsedNs;\n");
+  emitBodyLock(1, "mtProfileSerialFastTaskCount ++;\n");
+  emitBodyLock(1, "mtProfileSerialWallNs += elapsedNs;\n");
   emitBodyLock(0, "}\n");
 
   emitFuncDecl(0, "void S%s::recordMtProfileWorkerTask(int worker) {\n", name.c_str());
@@ -2558,18 +3946,32 @@ void graph::cppEmitter() {
 
   emitFuncDecl(0, "void S%s::dumpMtProfile() {\n", name.c_str());
   emitBodyLock(1, "if (!mtProfileEnabled) return;\n");
-  emitBodyLock(1, "fprintf(stderr, \"[mt-profile] helper_mode=%%s worker_count=%%d min_batch_tasks=%%d max_worker_count=%%d cycles=%%lu active_word_count=%%lu serial_tasks=%%lu pure_tasks=%%lu pure_batch_count=%%lu batch_wall_ns=%%lu serial_wall_ns=%%lu merge_wall_ns=%%lu total_step_ns=%%lu\\n\", mtProfileHelperMode, mtProfileConfiguredWorkerCount, mtMinBatchTasks, mtProfileMaxWorkerCount, cycles, mtProfileActiveWordCount, mtProfileSerialTasks, mtProfilePureTasks, mtProfilePureBatchCount, mtProfileBatchWallNs, mtProfileSerialWallNs, mtProfileMergeWallNs, mtProfileTotalStepNs);\n");
+  if (useMtHelpers) {
+    emitBodyLock(1, "fprintf(stderr, \"[mt-profile] helper_mode=%%s worker_count=%%d worker_pool=%%d min_batch_tasks=%%d max_worker_count=%%d cycles=%%lu active_word_count=%%lu serial_tasks=%%lu pure_tasks=%%lu pure_batch_count=%%lu true_parallel_batch_count=%%lu skipped_fake_parallel_batch_count=%%lu serial_fast_task_count=%%lu batch_wall_ns=%%lu true_parallel_wall_ns=%%lu serial_wall_ns=%%lu merge_wall_ns=%%lu total_step_ns=%%lu\\n\", mtProfileHelperMode, mtProfileConfiguredWorkerCount, mtWorkerPoolEnabled ? 1 : 0, mtMinBatchTasks, mtProfileMaxWorkerCount, cycles, mtProfileActiveWordCount, mtProfileSerialTasks, mtProfilePureTasks, mtProfilePureBatchCount, mtProfileTrueParallelBatchCount, mtProfileSkippedFakeParallelBatchCount, mtProfileSerialFastTaskCount, mtProfileBatchWallNs, mtProfileTrueParallelWallNs, mtProfileSerialWallNs, mtProfileMergeWallNs, mtProfileTotalStepNs);\n");
+  } else {
+    emitBodyLock(1, "fprintf(stderr, \"[mt-profile] helper_mode=%%s worker_count=%%d min_batch_tasks=%%d max_worker_count=%%d cycles=%%lu active_word_count=%%lu serial_tasks=%%lu pure_tasks=%%lu pure_batch_count=%%lu true_parallel_batch_count=%%lu skipped_fake_parallel_batch_count=%%lu serial_fast_task_count=%%lu batch_wall_ns=%%lu true_parallel_wall_ns=%%lu serial_wall_ns=%%lu merge_wall_ns=%%lu total_step_ns=%%lu\\n\", mtProfileHelperMode, mtProfileConfiguredWorkerCount, mtMinBatchTasks, mtProfileMaxWorkerCount, cycles, mtProfileActiveWordCount, mtProfileSerialTasks, mtProfilePureTasks, mtProfilePureBatchCount, mtProfileTrueParallelBatchCount, mtProfileSkippedFakeParallelBatchCount, mtProfileSerialFastTaskCount, mtProfileBatchWallNs, mtProfileTrueParallelWallNs, mtProfileSerialWallNs, mtProfileMergeWallNs, mtProfileTotalStepNs);\n");
+  }
+  emitBodyLock(1, "fprintf(stderr, \"[mt-profile] activation_delta entries=%%lu max_entries_per_worker=%%lu activate_all_count=%%lu\\n\", mtProfileActivationDeltaEntries, mtProfileActivationDeltaMaxEntriesPerWorker, mtProfileActivationDeltaActivateAllCount);\n");
+  emitBodyLock(1, "fprintf(stderr, \"[mt-profile] rejection_reasons not_active_whole=%%lu always_active_task=%%lu serial_task=%%lu dependency_edge=%%lu same_active_word_hazard=%%lu below_min_batch=%%lu configured_single_worker=%%lu\\n\", mtProfileRejectNotActiveWhole, mtProfileRejectAlwaysActiveTask, mtProfileRejectSerialTask, mtProfileRejectDependencyEdge, mtProfileRejectSameActiveWordHazard, mtProfileRejectBelowMinBatch, mtProfileRejectConfiguredSingleWorker);\n");
+  emitBodyLock(1, "fprintf(stderr, \"[mt-profile] batch_size_hist=%%lu,%%lu,%%lu,%%lu,%%lu,%%lu labels=1,2,3-4,5-8,9-15,16+\\n\", mtProfileBatchSizeHist[0], mtProfileBatchSizeHist[1], mtProfileBatchSizeHist[2], mtProfileBatchSizeHist[3], mtProfileBatchSizeHist[4], mtProfileBatchSizeHist[5]);\n");
+  emitBodyLock(1, "fprintf(stderr, \"[mt-profile] effective_worker_count_hist=\");\n");
+  emitBodyLock(1, "for (size_t i = 0; i < mtProfileEffectiveWorkerCountHist.size(); i ++) fprintf(stderr, \"%%s%%zu:%%lu\", i == 0 ? \"\" : \",\", i, mtProfileEffectiveWorkerCountHist[i]);\n");
+  emitBodyLock(1, "fprintf(stderr, \"\\n\");\n");
+  emitBodyLock(1, "fprintf(stderr, \"[mt-profile] partition_facts batch_member_node_count=%%lu same_active_word_forward_edges=%%lu cross_batch_activation_fanout=%%lu\\n\", mtProfileBatchMemberNodeCount, mtProfileSameActiveWordForwardEdges, mtProfileCrossBatchActivationFanout);\n");
   emitBodyLock(1, "fprintf(stderr, \"[mt-profile] worker_task_count=\");\n");
   emitBodyLock(1, "for (size_t i = 0; i < mtProfileWorkerTaskCount.size(); i ++) fprintf(stderr, \"%%s%%lu\", i == 0 ? \"\" : \",\", mtProfileWorkerTaskCount[i]);\n");
   emitBodyLock(1, "fprintf(stderr, \"\\n\");\n");
-  emitBodyLock(1, "fprintf(stderr, \"[mt-profile] task_cpp_ids=\");\n");
-  emitBodyLock(1, "bool firstTask = true;\n");
-  emitBodyLock(1, "for (int i = 0; i < %d; i ++) {\n", superId);
-  emitBodyLock(2, "if (mtProfileTaskExecCount[i] == 0) continue;\n");
-  emitBodyLock(2, "fprintf(stderr, \"%%s%%d:%%lu\", firstTask ? \"\" : \",\", i, mtProfileTaskExecCount[i]);\n");
-  emitBodyLock(2, "firstTask = false;\n");
+  emitBodyLock(1, "const char *taskProfileEnv = getenv(\"GSIM_MT_PROFILE_TASKS\");\n");
+  emitBodyLock(1, "if (taskProfileEnv != nullptr && taskProfileEnv[0] != '\\0' && taskProfileEnv[0] != '0') {\n");
+  emitBodyLock(2, "fprintf(stderr, \"[mt-profile] task_cpp_ids=\");\n");
+  emitBodyLock(2, "bool firstTask = true;\n");
+  emitBodyLock(2, "for (int i = 0; i < %d; i ++) {\n", superId);
+  emitBodyLock(3, "if (mtProfileTaskExecCount[i] == 0) continue;\n");
+  emitBodyLock(3, "fprintf(stderr, \"%%s%%d:%%lu\", firstTask ? \"\" : \",\", i, mtProfileTaskExecCount[i]);\n");
+  emitBodyLock(3, "firstTask = false;\n");
+  emitBodyLock(2, "}\n");
+  emitBodyLock(2, "fprintf(stderr, \"\\n\");\n");
   emitBodyLock(1, "}\n");
-  emitBodyLock(1, "fprintf(stderr, \"\\n\");\n");
   emitBodyLock(0, "}\n");
 
   /* activation all nodes for reset */
@@ -2593,7 +3995,8 @@ void graph::cppEmitter() {
   genResetAll();
   for (int i = 0; i < resetFuncNum; i ++) {
     fprintf(header, "void subReset%d();\n", i);
-    if (useBufferedHelpers) fprintf(header, "void subReset%d(ActiveBuffer &nextActive);\n", i);
+    if (globalConfig.MtHelperMode == "buffered-seq") fprintf(header, "void subReset%d(ActiveBuffer &nextActive);\n", i);
+    if (useMtHelpers) fprintf(header, "void subReset%d(ActivationDelta &nextActive);\n", i);
   }
 
   /* main evaluation loop (step) */
@@ -2603,17 +4006,33 @@ void graph::cppEmitter() {
   }
   if (useHelperTasks) {
     for (int i = 0; i < superId; i ++) {
-      if (useBufferedHelpers) fprintf(header, "void mtTask%d(uint%d_t &flag, ActiveBuffer &nextActive);\n", i, ACTIVE_WIDTH);
-      else fprintf(header, "void mtTask%d(uint%d_t &flag);\n", i, ACTIVE_WIDTH);
+      if (globalConfig.MtHelperMode == "buffered-seq") fprintf(header, "void mtTask%d(uint%d_t &flag, ActiveBuffer &nextActive);\n", i, ACTIVE_WIDTH);
+      if (useMtHelpers) fprintf(header, "void mtTask%d(uint%d_t &flag, ActivationDelta &nextActive);\n", i, ACTIVE_WIDTH);
+      if (!useBufferedHelpers || useMtHelpers) fprintf(header, "void mtTask%d(uint%d_t &flag);\n", i, ACTIVE_WIDTH);
     }
     if (useMtHelpers) {
       for (int i = 0; i < superId; i ++) {
         if (mtRepCutHeaderTasks[i].repcutRuntimeApplied) {
-          fprintf(header, "void mtRepCutLiteTask%d(uint%d_t &flag, ActiveBuffer &nextActive);\n", i, ACTIVE_WIDTH);
+          fprintf(header, "void mtRepCutLiteTask%d(uint%d_t &flag, ActivationDelta &nextActive);\n", i, ACTIVE_WIDTH);
         }
       }
     }
-    if (useMtHelpers) fprintf(header, "void mtRunPureBatch(int beginCppId, int endCppId, uint%d_t &activeWord);\n", ACTIVE_WIDTH);
+    if (useMtHelpers) {
+      int shardCount = mtPureBatchShardCount();
+      for (int shard = 0; shard < shardCount; shard ++) {
+        fprintf(header, "void mtRunPureBatchDirectShard%d(int chunkBegin, int chunkEnd, uint%d_t &activeWord);\n", shard, ACTIVE_WIDTH);
+        fprintf(header, "void mtRunPureBatchWorkerShard%d(int worker, int chunkBegin, int chunkEnd, std::vector<std::vector<int>> &mtProfileLocalTaskIds, std::vector<uint64_t> &mtProfileLocalWorkerTaskCount);\n", shard);
+      }
+      fprintf(header, "void mtRunPureBatchWorkerRange(int worker, int chunkBegin, int chunkEnd);\n");
+      fprintf(header, "void mtWorkerPoolLoop(int worker);\n");
+      fprintf(header, "void startMtWorkerPool();\n");
+      fprintf(header, "void stopMtWorkerPool();\n");
+      fprintf(header, "void mtRunPureBatch(int beginCppId, int endCppId, uint%d_t &activeWord);\n", ACTIVE_WIDTH);
+      if (useCoarseMt) {
+        fprintf(header, "void mtRunCoarseLayerWorkerRange(int worker, int regionIndex, int layerIndex, int chunkBegin, int chunkEnd);\n");
+        fprintf(header, "void mtRunCoarseRegion(int regionIndex, uint%d_t *coarseActiveWords);\n", ACTIVE_WIDTH);
+      }
+    }
   }
 
   /* step wrapper */
