@@ -149,6 +149,14 @@ struct MtCoarseRegionPlan {
   std::vector<MtCoarseRegion> regions;
 };
 
+struct MtCoarseProfileFacts {
+  int runtimeEligibleRegionCount = 0;
+  int runtimeLayerCount = 0;
+  int maxRegionLayerCount = 0;
+  int layerSizeHist[6] = {0, 0, 0, 0, 0, 0};
+  int regionLayerCountHist[6] = {0, 0, 0, 0, 0, 0};
+};
+
 struct MtRepCutClone {
   int sourceCppId = -1;
   int sinkCppId = -1;
@@ -921,6 +929,30 @@ static MtCoarseRegionPlan planMtCoarseRegions(const std::map<int, MtTaskInfo>& t
     }
   }
   return plan;
+}
+
+static int mtHistBucket(int count) {
+  if (count <= 1) return 0;
+  if (count == 2) return 1;
+  if (count <= 4) return 2;
+  if (count <= 8) return 3;
+  if (count <= 15) return 4;
+  return 5;
+}
+
+static MtCoarseProfileFacts mtComputeCoarseProfileFacts(const MtCoarseRegionPlan& coarsePlan) {
+  MtCoarseProfileFacts facts;
+  for (const MtCoarseRegion& region : coarsePlan.regions) {
+    if (!region.runtimeEligible) continue;
+    facts.runtimeEligibleRegionCount ++;
+    facts.runtimeLayerCount += static_cast<int>(region.layers.size());
+    facts.maxRegionLayerCount = std::max(facts.maxRegionLayerCount, static_cast<int>(region.layers.size()));
+    facts.regionLayerCountHist[mtHistBucket(static_cast<int>(region.layers.size()))] ++;
+    for (const MtCoarseLayer& layer : region.layers) {
+      facts.layerSizeHist[mtHistBucket(static_cast<int>(layer.taskCppIds.size()))] ++;
+    }
+  }
+  return facts;
 }
 
 static MtPureBatchPlan planMtPureBatchesLegacy(const std::map<int, MtTaskInfo>& tasks, bool allowCuts) {
@@ -3180,6 +3212,10 @@ void graph::genMtCoarseRegionRunner(const MtRepCutSemanticPlan& semanticPlan, co
   emitBodyLock(2, "default:\n");
   emitBodyLock(3, "return;\n");
   emitBodyLock(1, "}\n");
+  emitBodyLock(1, "if (mtProfileEnabled) {\n");
+  emitBodyLock(2, "mtProfileCoarseRegionInvocations ++;\n");
+  emitBodyLock(2, "mtProfileCoarseEstimatedBarrierCount += regionLayerCount;\n");
+  emitBodyLock(1, "}\n");
   emitBodyLock(1, "int workerCount = mtConfiguredWorkerCount;\n");
   emitBodyLock(1, "if (workerCount > regionTaskCount) workerCount = regionTaskCount;\n");
   emitBodyLock(1, "if (workerCount < 2) workerCount = 1;\n");
@@ -3238,6 +3274,12 @@ void graph::genMtCoarseRegionRunner(const MtRepCutSemanticPlan& semanticPlan, co
   emitBodyLock(2, "int layerWorkerCount = workerCount;\n");
   emitBodyLock(2, "if (layerWorkerCount > layerTaskCount) layerWorkerCount = layerTaskCount;\n");
   emitBodyLock(2, "if (layerWorkerCount < 1) layerWorkerCount = 1;\n");
+  emitBodyLock(2, "if (mtProfileEnabled) {\n");
+  emitBodyLock(3, "mtProfileCoarseLayerDispatches ++;\n");
+  emitBodyLock(3, "mtProfileCoarseWorkerJobs += layerWorkerCount;\n");
+  emitBodyLock(3, "mtProfileCoarseFlagWordCopies += (uint64_t)workerCount * (uint64_t)regionActiveWordSpan;\n");
+  emitBodyLock(3, "mtProfileCoarseLayerSizeHist[layerTaskCount <= 1 ? 0 : (layerTaskCount == 2 ? 1 : (layerTaskCount <= 4 ? 2 : (layerTaskCount <= 8 ? 3 : (layerTaskCount <= 15 ? 4 : 5))))] ++;\n");
+  emitBodyLock(2, "}\n");
   emitBodyLock(2, "if (layerWorkerCount == 1) {\n");
   emitBodyLock(3, "mtRunCoarseLayerWorkerRange(0, regionIndex, layer, 0, layerTaskCount);\n");
   emitBodyLock(2, "} else if (mtWorkerPoolEnabled && mtWorkerPoolThreadCount >= layerWorkerCount) {\n");
@@ -3284,7 +3326,9 @@ void graph::genMtCoarseRegionRunner(const MtRepCutSemanticPlan& semanticPlan, co
   emitBodyLock(3, "}\n");
   emitBodyLock(2, "}\n");
   emitBodyLock(2, "if (mtProfileEnabled) {\n");
+  emitBodyLock(3, "mtProfileCoarseMergeWordScans += (uint64_t)layerWorkerCount * (uint64_t)regionActiveWordSpan;\n");
   emitBodyLock(3, "for (int worker = 0; worker < layerWorkerCount; worker ++) {\n");
+  emitBodyLock(4, "mtProfileCoarseActivationDeltaEntries += mtWorkerDeltas[worker].entries.size();\n");
   emitBodyLock(4, "mtProfileActivationDeltaEntries += mtWorkerDeltas[worker].entries.size();\n");
   emitBodyLock(4, "if (mtWorkerDeltas[worker].entries.size() > mtProfileActivationDeltaMaxEntriesPerWorker) mtProfileActivationDeltaMaxEntriesPerWorker = mtWorkerDeltas[worker].entries.size();\n");
   emitBodyLock(4, "if (mtWorkerDeltas[worker].allActive) mtProfileActivationDeltaActivateAllCount ++;\n");
@@ -3719,9 +3763,13 @@ void graph::cppEmitter() {
   bool useHelperTasks = useSeqHelpers || useMtHelpers;
   bool useCoarseMt = useMtHelpers && globalConfig.MtBatchFormationMode == "coarse";
   std::map<int, MtTaskInfo> mtRepCutHeaderTasks;
+  MtCoarseProfileFacts mtCoarseProfileFacts;
   if (useMtHelpers) {
     mtRepCutHeaderTasks = buildMtTaskInfoMapWithRepCutSelection();
     markMtRepCutLiteRuntimeApplied(mtRepCutHeaderTasks);
+    if (useCoarseMt) {
+      mtCoarseProfileFacts = mtComputeCoarseProfileFacts(planMtCoarseRegions(mtRepCutHeaderTasks));
+    }
   }
   if (globalConfig.MtHelperMode == "buffered-seq") emitActiveBufferDef(header, activeFlagNum);
   if (useMtHelpers) emitActivationDeltaDef(header, activeFlagNum);
@@ -3761,6 +3809,20 @@ void graph::cppEmitter() {
   fprintf(header, "uint64_t mtProfileSerialWallNs;\n");
   fprintf(header, "uint64_t mtProfileMergeWallNs;\n");
   fprintf(header, "uint64_t mtProfileTotalStepNs;\n");
+  if (useCoarseMt) {
+    fprintf(header, "uint64_t mtProfileCoarseStaticRuntimeEligibleRegions;\n");
+    fprintf(header, "uint64_t mtProfileCoarseStaticLayerCount;\n");
+    fprintf(header, "uint64_t mtProfileCoarseStaticMaxRegionLayerCount;\n");
+    fprintf(header, "uint64_t mtProfileCoarseRegionInvocations;\n");
+    fprintf(header, "uint64_t mtProfileCoarseLayerDispatches;\n");
+    fprintf(header, "uint64_t mtProfileCoarseWorkerJobs;\n");
+    fprintf(header, "uint64_t mtProfileCoarseFlagWordCopies;\n");
+    fprintf(header, "uint64_t mtProfileCoarseMergeWordScans;\n");
+    fprintf(header, "uint64_t mtProfileCoarseActivationDeltaEntries;\n");
+    fprintf(header, "uint64_t mtProfileCoarseEstimatedBarrierCount;\n");
+    fprintf(header, "uint64_t mtProfileCoarseLayerSizeHist[6];\n");
+    fprintf(header, "uint64_t mtProfileCoarseRegionLayerCountHist[6];\n");
+  }
   fprintf(header, "uint64_t mtProfileTaskExecCount[%d];\n", superId);
   fprintf(header, "std::vector<uint64_t> mtProfileWorkerTaskCount;\n");
   fprintf(header, "uint64_t mtProfileBatchSizeHist[6];\n");
@@ -3905,6 +3967,22 @@ void graph::cppEmitter() {
   emitBodyLock(1, "mtProfileSerialWallNs = 0;\n");
   emitBodyLock(1, "mtProfileMergeWallNs = 0;\n");
   emitBodyLock(1, "mtProfileTotalStepNs = 0;\n");
+  if (useCoarseMt) {
+    emitBodyLock(1, "mtProfileCoarseStaticRuntimeEligibleRegions = %d;\n", mtCoarseProfileFacts.runtimeEligibleRegionCount);
+    emitBodyLock(1, "mtProfileCoarseStaticLayerCount = %d;\n", mtCoarseProfileFacts.runtimeLayerCount);
+    emitBodyLock(1, "mtProfileCoarseStaticMaxRegionLayerCount = %d;\n", mtCoarseProfileFacts.maxRegionLayerCount);
+    emitBodyLock(1, "mtProfileCoarseRegionInvocations = 0;\n");
+    emitBodyLock(1, "mtProfileCoarseLayerDispatches = 0;\n");
+    emitBodyLock(1, "mtProfileCoarseWorkerJobs = 0;\n");
+    emitBodyLock(1, "mtProfileCoarseFlagWordCopies = 0;\n");
+    emitBodyLock(1, "mtProfileCoarseMergeWordScans = 0;\n");
+    emitBodyLock(1, "mtProfileCoarseActivationDeltaEntries = 0;\n");
+    emitBodyLock(1, "mtProfileCoarseEstimatedBarrierCount = 0;\n");
+    emitBodyLock(1, "for (int i = 0; i < 6; i ++) mtProfileCoarseLayerSizeHist[i] = 0;\n");
+    for (int i = 0; i < 6; i ++) {
+      emitBodyLock(1, "mtProfileCoarseRegionLayerCountHist[%d] = %d;\n", i, mtCoarseProfileFacts.regionLayerCountHist[i]);
+    }
+  }
   emitBodyLock(1, "for (int i = 0; i < %d; i ++) mtProfileTaskExecCount[i] = 0;\n", superId);
   emitBodyLock(1, "for (int i = 0; i < 6; i ++) mtProfileBatchSizeHist[i] = 0;\n");
   emitBodyLock(1, "mtProfileWorkerTaskCount.assign((size_t)mtProfileConfiguredWorkerCount, 0);\n");
@@ -3950,6 +4028,13 @@ void graph::cppEmitter() {
     emitBodyLock(1, "fprintf(stderr, \"[mt-profile] helper_mode=%%s worker_count=%%d worker_pool=%%d min_batch_tasks=%%d max_worker_count=%%d cycles=%%lu active_word_count=%%lu serial_tasks=%%lu pure_tasks=%%lu pure_batch_count=%%lu true_parallel_batch_count=%%lu skipped_fake_parallel_batch_count=%%lu serial_fast_task_count=%%lu batch_wall_ns=%%lu true_parallel_wall_ns=%%lu serial_wall_ns=%%lu merge_wall_ns=%%lu total_step_ns=%%lu\\n\", mtProfileHelperMode, mtProfileConfiguredWorkerCount, mtWorkerPoolEnabled ? 1 : 0, mtMinBatchTasks, mtProfileMaxWorkerCount, cycles, mtProfileActiveWordCount, mtProfileSerialTasks, mtProfilePureTasks, mtProfilePureBatchCount, mtProfileTrueParallelBatchCount, mtProfileSkippedFakeParallelBatchCount, mtProfileSerialFastTaskCount, mtProfileBatchWallNs, mtProfileTrueParallelWallNs, mtProfileSerialWallNs, mtProfileMergeWallNs, mtProfileTotalStepNs);\n");
   } else {
     emitBodyLock(1, "fprintf(stderr, \"[mt-profile] helper_mode=%%s worker_count=%%d min_batch_tasks=%%d max_worker_count=%%d cycles=%%lu active_word_count=%%lu serial_tasks=%%lu pure_tasks=%%lu pure_batch_count=%%lu true_parallel_batch_count=%%lu skipped_fake_parallel_batch_count=%%lu serial_fast_task_count=%%lu batch_wall_ns=%%lu true_parallel_wall_ns=%%lu serial_wall_ns=%%lu merge_wall_ns=%%lu total_step_ns=%%lu\\n\", mtProfileHelperMode, mtProfileConfiguredWorkerCount, mtMinBatchTasks, mtProfileMaxWorkerCount, cycles, mtProfileActiveWordCount, mtProfileSerialTasks, mtProfilePureTasks, mtProfilePureBatchCount, mtProfileTrueParallelBatchCount, mtProfileSkippedFakeParallelBatchCount, mtProfileSerialFastTaskCount, mtProfileBatchWallNs, mtProfileTrueParallelWallNs, mtProfileSerialWallNs, mtProfileMergeWallNs, mtProfileTotalStepNs);\n");
+  }
+  if (useCoarseMt) {
+    emitBodyLock(1, "fprintf(stderr, \"[mt-profile] coarse_dispatch static_runtime_eligible_regions=%%lu static_layer_count=%%lu max_region_layer_count=%%lu region_invocations=%%lu layer_dispatches=%%lu worker_jobs=%%lu flag_word_copies=%%lu merge_word_scans=%%lu activation_delta_entries=%%lu estimated_barriers=%%lu\\n\", mtProfileCoarseStaticRuntimeEligibleRegions, mtProfileCoarseStaticLayerCount, mtProfileCoarseStaticMaxRegionLayerCount, mtProfileCoarseRegionInvocations, mtProfileCoarseLayerDispatches, mtProfileCoarseWorkerJobs, mtProfileCoarseFlagWordCopies, mtProfileCoarseMergeWordScans, mtProfileCoarseActivationDeltaEntries, mtProfileCoarseEstimatedBarrierCount);\n");
+    emitBodyLock(1, "fprintf(stderr, \"[mt-profile] coarse_layer_size_hist=%%lu,%%lu,%%lu,%%lu,%%lu,%%lu static=%%d,%%d,%%d,%%d,%%d,%%d labels=1,2,3-4,5-8,9-15,16+\\n\", mtProfileCoarseLayerSizeHist[0], mtProfileCoarseLayerSizeHist[1], mtProfileCoarseLayerSizeHist[2], mtProfileCoarseLayerSizeHist[3], mtProfileCoarseLayerSizeHist[4], mtProfileCoarseLayerSizeHist[5], %d, %d, %d, %d, %d, %d);\n",
+                 mtCoarseProfileFacts.layerSizeHist[0], mtCoarseProfileFacts.layerSizeHist[1], mtCoarseProfileFacts.layerSizeHist[2],
+                 mtCoarseProfileFacts.layerSizeHist[3], mtCoarseProfileFacts.layerSizeHist[4], mtCoarseProfileFacts.layerSizeHist[5]);
+    emitBodyLock(1, "fprintf(stderr, \"[mt-profile] coarse_region_layer_count_hist=%%lu,%%lu,%%lu,%%lu,%%lu,%%lu labels=1,2,3-4,5-8,9-15,16+\\n\", mtProfileCoarseRegionLayerCountHist[0], mtProfileCoarseRegionLayerCountHist[1], mtProfileCoarseRegionLayerCountHist[2], mtProfileCoarseRegionLayerCountHist[3], mtProfileCoarseRegionLayerCountHist[4], mtProfileCoarseRegionLayerCountHist[5]);\n");
   }
   emitBodyLock(1, "fprintf(stderr, \"[mt-profile] activation_delta entries=%%lu max_entries_per_worker=%%lu activate_all_count=%%lu\\n\", mtProfileActivationDeltaEntries, mtProfileActivationDeltaMaxEntriesPerWorker, mtProfileActivationDeltaActivateAllCount);\n");
   emitBodyLock(1, "fprintf(stderr, \"[mt-profile] rejection_reasons not_active_whole=%%lu always_active_task=%%lu serial_task=%%lu dependency_edge=%%lu same_active_word_hazard=%%lu below_min_batch=%%lu configured_single_worker=%%lu\\n\", mtProfileRejectNotActiveWhole, mtProfileRejectAlwaysActiveTask, mtProfileRejectSerialTask, mtProfileRejectDependencyEdge, mtProfileRejectSameActiveWordHazard, mtProfileRejectBelowMinBatch, mtProfileRejectConfiguredSingleWorker);\n");
