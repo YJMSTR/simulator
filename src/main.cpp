@@ -48,6 +48,7 @@ Config::Config() {
   MtHelperMode = "off";
   MtRepCutLiteMode = "off";
   MtBatchFormationMode = "legacy";
+  MtCoarseRuntimeMode = "layered";
   OutputDir = ".";
   InputBaseName = "";
   SuperNodeMaxSize = 35;
@@ -157,6 +158,8 @@ static void printUsage(const char* ProgName) {
             << "      --mt-repcut-fanout-budget=N   Per-candidate RepCut-lite fanout budget; default 0.\n"
             << "      --mt-batch-formation=legacy|active-frequency|coarse\n"
             << "                                      Select pure batch formation mode; legacy is default.\n"
+            << "      --mt-coarse-runtime=layered|mtask\n"
+            << "                                      Select coarse runtime lowering; layered preserves the 18X runtime.\n"
             << "      --mt-active-frequency-cost-threshold=N\n"
             << "                                      Minimum estimated released static cost for active-frequency batches; default 2.\n"
             << "      --dump-mt-repcut-lite-report  Write a deterministic RepCut-lite candidate report JSON.\n"
@@ -197,6 +200,7 @@ static char* parseCommandLine(int argc, char** argv) {
     OPT_MT_REPCUT_COPY_BUDGET,
     OPT_MT_REPCUT_FANOUT_BUDGET,
     OPT_MT_BATCH_FORMATION,
+    OPT_MT_COARSE_RUNTIME,
     OPT_MT_ACTIVE_FREQUENCY_COST_THRESHOLD,
     OPT_DUMP_MT_REPCUT_LITE_REPORT,
     OPT_DUMP_MT_COARSE_REGION_REPORT,
@@ -226,6 +230,7 @@ static char* parseCommandLine(int argc, char** argv) {
       {"mt-repcut-copy-budget", required_argument, nullptr, 0},
       {"mt-repcut-fanout-budget", required_argument, nullptr, 0},
       {"mt-batch-formation", required_argument, nullptr, 0},
+      {"mt-coarse-runtime", required_argument, nullptr, 0},
       {"mt-active-frequency-cost-threshold", required_argument, nullptr, 0},
       {"dump-mt-repcut-lite-report", no_argument, nullptr, 0},
       {"dump-mt-coarse-region-report", no_argument, nullptr, 0},
@@ -341,6 +346,17 @@ static char* parseCommandLine(int argc, char** argv) {
                       globalConfig.MtBatchFormationMode != "active-frequency" &&
                       globalConfig.MtBatchFormationMode != "coarse") {
                     fprintf(stderr, "Error: unknown --mt-batch-formation '%s' (expected legacy, active-frequency, or coarse).\n", optarg);
+                    printUsage(argv[0]);
+                    std::cout.flush();
+                    fflush(nullptr);
+                    _exit(EXIT_FAILURE);
+                  }
+                  break;
+                case OPT_MT_COARSE_RUNTIME:
+                  globalConfig.MtCoarseRuntimeMode = optarg;
+                  if (globalConfig.MtCoarseRuntimeMode != "layered" &&
+                      globalConfig.MtCoarseRuntimeMode != "mtask") {
+                    fprintf(stderr, "Error: unknown --mt-coarse-runtime '%s' (expected layered or mtask).\n", optarg);
                     printUsage(argv[0]);
                     std::cout.flush();
                     fflush(nullptr);

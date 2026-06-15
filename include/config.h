@@ -14,6 +14,7 @@ struct Config {
   std::string MtHelperMode;
   std::string MtRepCutLiteMode;
   std::string MtBatchFormationMode;
+  std::string MtCoarseRuntimeMode;
   std::string OutputDir;
   std::string InputBaseName;
   int SuperNodeMaxSize;
