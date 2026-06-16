@@ -3095,11 +3095,11 @@ void graph::genSuperEval(SuperNode* super, std::string flagName, std::string act
 }
 
 
-int graph::genActivate() {
-    emitFuncDecl(0, "void S%s::subStep0() {\n", name.c_str());
+int graph::genActivate(const std::string& subStepSuffix) {
+    emitFuncDecl(0, "void S%s::subStep0%s() {\n", name.c_str(), subStepSuffix.c_str());
     int indent = 1;
     int nextSubStepIdx = 1;
-    std::string nextFuncDef = format("void S%s::subStep%d()", name.c_str(), nextSubStepIdx);
+    std::string nextFuncDef = format("void S%s::subStep%d%s()", name.c_str(), nextSubStepIdx, subStepSuffix.c_str());
     bool prevActiveWhole = false;
     for (int idx = 0; idx < superId; idx ++) {
       int id;
@@ -3117,7 +3117,7 @@ int graph::genActivate() {
         if (prevActiveWhole) {
           bool newFile = __emitSrc(indent ++, true, false, nextFuncDef.c_str(), "if(unlikely(activeFlags[%d] != 0)) {\n", id);
           if (newFile) {
-            nextFuncDef = format("void S%s::subStep%d()", name.c_str(), ++ nextSubStepIdx);
+            nextFuncDef = format("void S%s::subStep%d%s()", name.c_str(), ++ nextSubStepIdx, subStepSuffix.c_str());
           }
           emitBodyLock(indent, "uint%d_t oldFlag = activeFlags[%d];\n", ACTIVE_WIDTH, id);
           emitBodyLock(indent, "activeFlags[%d] = 0;\n", id);
@@ -4174,7 +4174,7 @@ int graph::genActivateSeqHelpers(bool buffered) {
     return nextSubStepIdx - 1;
 }
 
-int graph::genActivateMtHelpers() {
+int graph::genActivateMtHelpers(int serialFastSubStepMax, const std::string& serialFastSuffix) {
     std::map<int, MtTaskInfo> mtTasks = buildMtTaskInfoMapWithRepCutSelection();
     markMtRepCutLiteRuntimeApplied(mtTasks);
     MtRepCutSemanticPlan semanticPlan = planMtRepCutSemantics(mtTasks);
@@ -4207,6 +4207,14 @@ int graph::genActivateMtHelpers() {
 
     emitFuncDecl(0, "void S%s::subStep0() {\n", name.c_str());
     int indent = 1;
+    if (serialFastSubStepMax >= 0) {
+      emitBodyLock(indent, "if (mtConfiguredWorkerCount <= 1 && !mtProfileEnabled) {\n");
+      for (int fastIdx = 0; fastIdx <= serialFastSubStepMax; fastIdx ++) {
+        emitBodyLock(indent + 1, "subStep%d%s();\n", fastIdx, serialFastSuffix.c_str());
+      }
+      emitBodyLock(indent + 1, "return;\n");
+      emitBodyLock(indent, "}\n");
+    }
     int nextSubStepIdx = 1;
     std::string nextFuncDef = format("void S%s::subStep%d()", name.c_str(), nextSubStepIdx);
     bool prevActiveWhole = false;
@@ -4885,9 +4893,25 @@ void graph::cppEmitter() {
   }
 
   /* main evaluation loop (step) */
-  int subStepIdxMax = useMtHelpers ? genActivateMtHelpers() : (useSeqHelpers ? genActivateSeqHelpers(useBufferedHelpers) : genActivate());
+  int subStepIdxMax = 0;
+  int serialFastSubStepMax = -1;
+  std::string serialFastSuffix;
+  if (useMtHelpers) {
+    serialFastSuffix = "SerialFast";
+    serialFastSubStepMax = genActivate(serialFastSuffix);
+    subStepIdxMax = genActivateMtHelpers(serialFastSubStepMax, serialFastSuffix);
+  } else if (useSeqHelpers) {
+    subStepIdxMax = genActivateSeqHelpers(useBufferedHelpers);
+  } else {
+    subStepIdxMax = genActivate();
+  }
   for (int i = 0; i <= subStepIdxMax; i ++) {
     fprintf(header, "void subStep%d();\n", i);
+  }
+  if (serialFastSubStepMax >= 0) {
+    for (int i = 0; i <= serialFastSubStepMax; i ++) {
+      fprintf(header, "void subStep%d%s();\n", i, serialFastSuffix.c_str());
+    }
   }
   if (useHelperTasks) {
     for (int i = 0; i < superId; i ++) {

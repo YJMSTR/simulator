@@ -32,7 +32,7 @@ class graph {
   void genMemInit(Node* node);
   void nodeDisplay(Node* member, int indent);
   void genMemRead(FILE* fp);
-  int genActivate();
+  int genActivate(const std::string& subStepSuffix = "");
   void genUpdateRegister(FILE* fp);
   void genMemWrite(FILE* fp);
   void saveDiffRegs();
@@ -47,7 +47,7 @@ class graph {
   void genMtTaskRunner(const MtRepCutSemanticPlan& semanticPlan);
   void genMtCoarseRegionRunner(const MtRepCutSemanticPlan& semanticPlan, const MtCoarseRegionPlan& coarsePlan);
   int genActivateSeqHelpers(bool buffered);
-  int genActivateMtHelpers();
+  int genActivateMtHelpers(int serialFastSubStepMax = -1, const std::string& serialFastSuffix = "");
   void removeNodesNoConnect(NodeStatus status);
   void reconnectSuper();
   void reconnectAll();
