@@ -250,6 +250,9 @@ check-mt-23x-blocker-inspection: $(GSIM_BIN)
 	python3 scripts/check-mt-23x-blocker-inspection-report.py
 	@$(MAKE) check-mt-22x-macro-fiber-planner FIR_TEST_TIMEOUT="$(FIR_TEST_TIMEOUT)"
 
+check-mt-24x-top-blocker-source-audit: $(GSIM_BIN)
+	python3 scripts/check-mt-24x-top-blocker-source-audit.py
+
 check-mt-active-buffer: $(GSIM_BIN)
 	@test -n "$(FIR_TEST)" || (echo "Usage: make check-mt-active-buffer FIR_TEST=<case-name>" >&2; exit 1)
 	@test -f "$(FIR_TEST_INPUT_DIR)/$(FIR_TEST).fir" || \
