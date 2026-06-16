@@ -3489,6 +3489,28 @@ void graph::genMtCoarseRegionRunner(const MtRepCutSemanticPlan& semanticPlan, co
   emitBodyLock(1, "int workerCount = mtConfiguredWorkerCount;\n");
   emitBodyLock(1, "if (workerCount > regionTaskCount) workerCount = regionTaskCount;\n");
   emitBodyLock(1, "if (workerCount < 2) workerCount = 1;\n");
+  if (globalConfig.MtCoarseProfitabilityMode == "static") {
+    emitBodyLock(1, "if (workerCount > 1) {\n");
+    emitBodyLock(2, "if (regionMaxParallelWidth > 0 && workerCount > regionMaxParallelWidth) workerCount = regionMaxParallelWidth;\n");
+    emitBodyLock(2, "int workerCapByActiveWords = regionActiveWordSpan <= 0 ? workerCount : regionMemberNodeCount / (regionActiveWordSpan * 8);\n");
+    emitBodyLock(2, "int workerCapByMemberCost = regionMemberNodeCount / 8;\n");
+    emitBodyLock(2, "int workerCapByStaticCost = regionStaticCost / 4;\n");
+    emitBodyLock(2, "int profitabilityWorkerCap = workerCount;\n");
+    emitBodyLock(2, "if (workerCapByActiveWords > 0 && profitabilityWorkerCap > workerCapByActiveWords) profitabilityWorkerCap = workerCapByActiveWords;\n");
+    emitBodyLock(2, "if (workerCapByMemberCost > 0 && profitabilityWorkerCap > workerCapByMemberCost) profitabilityWorkerCap = workerCapByMemberCost;\n");
+    emitBodyLock(2, "if (workerCapByStaticCost > 0 && profitabilityWorkerCap > workerCapByStaticCost) profitabilityWorkerCap = workerCapByStaticCost;\n");
+    emitBodyLock(2, "if (profitabilityWorkerCap < 1) profitabilityWorkerCap = 1;\n");
+    emitBodyLock(2, "workerCount = profitabilityWorkerCap;\n");
+    emitBodyLock(1, "}\n");
+    emitBodyLock(1, "if (workerCount > 1 && regionMemberNodeCount < workerCount * 8) workerCount = 1;\n");
+    emitBodyLock(1, "if (workerCount > 1 && regionStaticCost < workerCount * 4) workerCount = 1;\n");
+    emitBodyLock(1, "if (workerCount > 1 && regionActiveWordSpan > 0 && regionMemberNodeCount < regionActiveWordSpan * workerCount * 8) workerCount = 1;\n");
+  }
+  if (globalConfig.MtCoarseRuntimeMode == "mtask" &&
+      globalConfig.MtCoarseProfitabilityMode == "static") {
+    emitBodyLock(1, "if (workerCount > regionMTaskCount) workerCount = regionMTaskCount;\n");
+    emitBodyLock(1, "if (workerCount < 1) workerCount = 1;\n");
+  }
   emitBodyLock(1, "if (mtProfileEnabled) {\n");
   emitBodyLock(2, "int batchSizeBucket = regionTaskCount <= 1 ? 0 : (regionTaskCount == 2 ? 1 : (regionTaskCount <= 4 ? 2 : (regionTaskCount <= 8 ? 3 : (regionTaskCount <= 15 ? 4 : 5))));\n");
   emitBodyLock(2, "mtProfileBatchSizeHist[batchSizeBucket] ++;\n");
@@ -3606,7 +3628,11 @@ void graph::genMtCoarseRegionRunner(const MtRepCutSemanticPlan& semanticPlan, co
     emitBodyLock(1, "}\n");
     emitBodyLock(1, "if (mtProfileEnabled) mtProfileMergeWallNs += std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - mtProfileMergeBegin).count();\n");
     emitBodyLock(1, "if (mtProfileEnabled) mtProfileBatchWallNs += std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - mtProfileBatchBegin).count();\n");
-    emitBodyLock(1, "if (mtProfileEnabled && workerCount > 1) mtProfileTrueParallelWallNs += std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - mtProfileBatchBegin).count();\n");
+    if (globalConfig.MtCoarseProfitabilityMode == "static") {
+      emitBodyLock(1, "if (mtProfileEnabled && mtaskWorkerCount > 1) mtProfileTrueParallelWallNs += std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - mtProfileBatchBegin).count();\n");
+    } else {
+      emitBodyLock(1, "if (mtProfileEnabled && workerCount > 1) mtProfileTrueParallelWallNs += std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - mtProfileBatchBegin).count();\n");
+    }
     emitBodyLock(1, "return;\n");
   }
   emitBodyLock(1, "for (int layer = 0; layer < regionLayerCount; layer ++) {\n");
