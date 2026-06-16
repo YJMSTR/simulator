@@ -50,6 +50,7 @@ Config::Config() {
   MtBatchFormationMode = "legacy";
   MtCoarseRuntimeMode = "layered";
   MtCoarseProfitabilityMode = "off";
+  MtCoarseWorkerPolicyMode = "static";
   OutputDir = ".";
   InputBaseName = "";
   SuperNodeMaxSize = 35;
@@ -163,6 +164,8 @@ static void printUsage(const char* ProgName) {
             << "                                      Select coarse runtime lowering; layered preserves the 18X runtime.\n"
             << "      --mt-coarse-profitability=off|static\n"
             << "                                      Select conservative coarse admission/worker policy; off preserves 19X.\n"
+            << "      --mt-coarse-worker-policy=static|profitable\n"
+            << "                                      Select coarse MTask worker assignment policy; static preserves 20X.\n"
             << "      --mt-active-frequency-cost-threshold=N\n"
             << "                                      Minimum estimated released static cost for active-frequency batches; default 2.\n"
             << "      --dump-mt-repcut-lite-report  Write a deterministic RepCut-lite candidate report JSON.\n"
@@ -205,6 +208,7 @@ static char* parseCommandLine(int argc, char** argv) {
     OPT_MT_BATCH_FORMATION,
     OPT_MT_COARSE_RUNTIME,
     OPT_MT_COARSE_PROFITABILITY,
+    OPT_MT_COARSE_WORKER_POLICY,
     OPT_MT_ACTIVE_FREQUENCY_COST_THRESHOLD,
     OPT_DUMP_MT_REPCUT_LITE_REPORT,
     OPT_DUMP_MT_COARSE_REGION_REPORT,
@@ -236,6 +240,7 @@ static char* parseCommandLine(int argc, char** argv) {
       {"mt-batch-formation", required_argument, nullptr, 0},
       {"mt-coarse-runtime", required_argument, nullptr, 0},
       {"mt-coarse-profitability", required_argument, nullptr, 0},
+      {"mt-coarse-worker-policy", required_argument, nullptr, 0},
       {"mt-active-frequency-cost-threshold", required_argument, nullptr, 0},
       {"dump-mt-repcut-lite-report", no_argument, nullptr, 0},
       {"dump-mt-coarse-region-report", no_argument, nullptr, 0},
@@ -373,6 +378,17 @@ static char* parseCommandLine(int argc, char** argv) {
                   if (globalConfig.MtCoarseProfitabilityMode != "off" &&
                       globalConfig.MtCoarseProfitabilityMode != "static") {
                     fprintf(stderr, "Error: unknown --mt-coarse-profitability '%s' (expected off or static).\n", optarg);
+                    printUsage(argv[0]);
+                    std::cout.flush();
+                    fflush(nullptr);
+                    _exit(EXIT_FAILURE);
+                  }
+                  break;
+                case OPT_MT_COARSE_WORKER_POLICY:
+                  globalConfig.MtCoarseWorkerPolicyMode = optarg;
+                  if (globalConfig.MtCoarseWorkerPolicyMode != "static" &&
+                      globalConfig.MtCoarseWorkerPolicyMode != "profitable") {
+                    fprintf(stderr, "Error: unknown --mt-coarse-worker-policy '%s' (expected static or profitable).\n", optarg);
                     printUsage(argv[0]);
                     std::cout.flush();
                     fflush(nullptr);

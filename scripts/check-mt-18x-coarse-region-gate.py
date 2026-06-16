@@ -152,7 +152,8 @@ def check_coarse_structure(model_dir):
 
 
 def check_cross_word_report(report):
-    expect(report.get("format") == "gsim.mt-coarse-region-report.v1", "unexpected coarse report format")
+    expect(report.get("format") in ("gsim.mt-coarse-region-report.v1", "gsim.mt-coarse-region-report.v2"),
+           "unexpected coarse report format")
     expect(report.get("mode") == "coarse", "coarse report mode mismatch")
     regions = report.get("regions") or []
     eligible = [region for region in regions if region.get("runtime_eligible")]

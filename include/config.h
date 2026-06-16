@@ -16,6 +16,7 @@ struct Config {
   std::string MtBatchFormationMode;
   std::string MtCoarseRuntimeMode;
   std::string MtCoarseProfitabilityMode;
+  std::string MtCoarseWorkerPolicyMode;
   std::string OutputDir;
   std::string InputBaseName;
   int SuperNodeMaxSize;
