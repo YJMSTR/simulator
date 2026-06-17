@@ -152,9 +152,13 @@ static void printUsage(const char* ProgName) {
             << "      --dump-assign-tree           Include assignTree structure in JSON dump (can be large).\n"
             << "      --dump-const-status          Dump per-node constant-analysis status before removing constants.\n"
             << "      --dump-mt-schedule-json      Dump gsim-mt schedule metadata JSON without changing generated model behavior.\n"
-            << "      --mt-helper-mode=off|seq|buffered-seq|mt\n"
+            << "      --mt-helper-mode=off|seq|buffered-seq|mt|mt-level-dispatch\n"
             << "                                      Emit gsim-mt per-super helpers; off is the default.\n"
             << "                                      mt emits a bounded scan-order-preserving threaded helper runtime.\n"
+            << "                                      mt-level-dispatch (28c Phase 1A) admits safe-serial cppIds into the\n"
+            << "                                      coarse region path and routes worker0-only cppIds to the main thread.\n"
+            << "                                      mt-level-dispatch implies coarse batch formation + static profitability\n"
+            << "                                      unless the user already chose otherwise.\n"
             << "      --mt-repcut-lite=off|on       Enable bounded RepCut-lite candidate selection; off is the default.\n"
             << "      --mt-repcut-copy-budget=N     Total RepCut-lite copy cost budget; default 0.\n"
             << "      --mt-repcut-fanout-budget=N   Per-candidate RepCut-lite fanout budget; default 0.\n"
@@ -313,8 +317,9 @@ static char* parseCommandLine(int argc, char** argv) {
                   if (globalConfig.MtHelperMode != "off" &&
                       globalConfig.MtHelperMode != "seq" &&
                       globalConfig.MtHelperMode != "buffered-seq" &&
-                      globalConfig.MtHelperMode != "mt") {
-                    fprintf(stderr, "Error: unknown --mt-helper-mode '%s' (expected off, seq, buffered-seq, or mt).\n", optarg);
+                      globalConfig.MtHelperMode != "mt" &&
+                      globalConfig.MtHelperMode != "mt-level-dispatch") {
+                    fprintf(stderr, "Error: unknown --mt-helper-mode '%s' (expected off, seq, buffered-seq, mt, or mt-level-dispatch).\n", optarg);
                     printUsage(argv[0]);
                     std::cout.flush();
                     fflush(nullptr);
@@ -468,6 +473,21 @@ int main(int argc, char** argv) {
   graph* g = NULL;
   static int dumpIdx = 0;
   const char *InputFileName = parseCommandLine(argc, argv);
+
+
+  // 28c Phase 1A: mt-level-dispatch implies coarse formation + static profitability.
+  // Promote only when user has not explicitly chosen otherwise (defaults from
+  // Config::Config(): MtBatchFormationMode="legacy", MtCoarseProfitabilityMode="off").
+  if (globalConfig.MtHelperMode == "mt-level-dispatch") {
+    if (globalConfig.MtBatchFormationMode == "legacy") {
+      globalConfig.MtBatchFormationMode = "coarse";
+    }
+    if (globalConfig.MtCoarseProfitabilityMode == "off") {
+      globalConfig.MtCoarseProfitabilityMode = "static";
+    }
+    // MtCoarseRuntimeMode default "layered" + MtCoarseWorkerPolicyMode default "static"
+    // are exactly what 51-design §5.3 specifies for level-by-level dispatch.
+  }
 
   size_t size = 0, mapSize = 0;
   char *strbuf;

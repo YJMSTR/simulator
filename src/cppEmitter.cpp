@@ -21,6 +21,10 @@
 #define ACTIVE_WIDTH 8
 #define RESET_PER_FUNC 400
 #define MT_PURE_BATCH_SHARD_SIZE 256
+// 28c Phase 1A: hard cap on coarse region active-word span under mt-level-dispatch.
+// Pre-implementation G-1A2.0 simulation showed raw max span 649; cap=192 keeps the
+// dense merge upper bound bounded while only splitting 6 oversized regions.
+#define MT_LEVEL_DISPATCH_REGION_SPAN_CAP 192
 
 #define ENABLE_ACTIVATOR false
 
@@ -141,6 +145,7 @@ struct MtCoarseRegion {
   int expectedActiveCost = 0;
   int estimatedUsefulWork = 0;
   int pureTaskCount = 0;
+  int safeSerialTaskCount = 0;   // 28c Phase 1A: serial cppIds admitted under mt-level-dispatch
   int serialBlockerCount = 0;
   int dependencyEdgeCount = 0;
   int activeVisibilityEdgeCount = 0;
@@ -700,6 +705,38 @@ static bool mtTasksHaveDirectedEdge(SuperNode* from, SuperNode* to) {
   return false;
 }
 
+// 28c Phase 1A: any of these reasons forces the cppId to run on worker 0 (single-threaded
+// fall-through). external/memory_write/memory_read_unsupported/special are kimi-2.7-code
+// review I5 conservative. super_type_SUPER_EXTMOD covers the alwaysActive set.
+static bool hasWorker0OnlyReason(const std::vector<std::string>& reasons) {
+  for (const std::string& r : reasons) {
+    if (r == "external" || r == "memory_write" ||
+        r == "memory_read_unsupported" || r == "special" ||
+        r == "super_type_SUPER_EXTMOD") {
+      return true;
+    }
+  }
+  return false;
+}
+
+static bool mtIsLevelDispatchMode() {
+  return globalConfig.MtHelperMode == "mt-level-dispatch";
+}
+
+// 28c Phase 1A: admission gate for the coarse region under mt-level-dispatch.
+// pure_compute matches mtTaskCanEnterPureBatch; safe-serial cppIds whose only
+// serial_reasons are state_update/reset/async_reset/activate_all_path/
+// array_or_dynamic_index/super_type_SUPER_ASYNC_RESET/unknown_op are also admitted.
+// Worker0-only cppIds are rejected: they fall through to the main-thread serial path.
+static bool mtTaskCanEnterCoarseDispatch(const std::map<int, MtTaskInfo>& tasks, int cppId) {
+  auto iter = tasks.find(cppId);
+  if (iter == tasks.end()) return false;
+  if (isAlwaysActive(cppId)) return false;
+  if (iter->second.taskKind == "pure_compute") return true;
+  if (hasWorker0OnlyReason(iter->second.serialReasons)) return false;
+  return true;
+}
+
 static bool mtTaskCanEnterPureBatch(const std::map<int, MtTaskInfo>& tasks, int cppId) {
   auto iter = tasks.find(cppId);
   if (iter == tasks.end()) return false;
@@ -953,11 +990,23 @@ static MtCoarseRegion mtBuildCoarseRegion(const std::map<int, MtTaskInfo>& tasks
 
   for (int cppId = beginCppId; cppId < endCppId; cppId ++) {
     auto iter = tasks.find(cppId);
-    if (iter == tasks.end() || iter->second.taskKind != "pure_compute") {
+    bool isPure = iter != tasks.end() && iter->second.taskKind == "pure_compute";
+    bool isSafeSerial = mtIsLevelDispatchMode() && !isPure &&
+                        iter != tasks.end() &&
+                        !isAlwaysActive(cppId) &&
+                        !hasWorker0OnlyReason(iter->second.serialReasons);
+    if (!isPure) {
       region.pureTaskCount --;
       region.serialBlockerCount ++;
-      mtAddCoarseBlocker(region, "serial_task");
-      continue;
+      if (!isSafeSerial) {
+        // Either legacy mt mode (any non-pure rejects) OR worker0-only / always-active
+        // under mt-level-dispatch -> region rejected via serial_task blocker.
+        mtAddCoarseBlocker(region, "serial_task");
+        continue;
+      }
+      // mt-level-dispatch + safe-serial: admit into the coarse region path; cppId still
+      // runs in-worker emit-order (worker per-buffer + post-layer merge).
+      region.safeSerialTaskCount ++;
     }
     if (isAlwaysActive(cppId)) mtAddCoarseBlocker(region, "codegen_runtime_limit");
   }
@@ -990,7 +1039,7 @@ static MtCoarseRegion mtBuildCoarseRegion(const std::map<int, MtTaskInfo>& tasks
   if (region.activeWordSpan <= 1) {
     mtAddCoarseBlocker(region, "codegen_runtime_limit");
   }
-  if (region.pureTaskCount != region.taskCount) {
+  if (region.pureTaskCount + region.safeSerialTaskCount != region.taskCount) {
     mtAddCoarseBlocker(region, "serial_task");
   }
 
@@ -1020,12 +1069,18 @@ static MtCoarseRegionPlan planMtCoarseRegions(const std::map<int, MtTaskInfo>& t
       int wordEnd = std::min(superId, wordBegin + ACTIVE_WIDTH);
       bool wholeWordPure = wordEnd - wordBegin == ACTIVE_WIDTH;
       for (int cppId = wordBegin; cppId < wordEnd; cppId ++) {
-        if (!mtTaskCanEnterPureBatch(tasks, cppId)) {
+        bool ok = mtIsLevelDispatchMode()
+                    ? mtTaskCanEnterCoarseDispatch(tasks, cppId)
+                    : mtTaskCanEnterPureBatch(tasks, cppId);
+        if (!ok) {
           wholeWordPure = false;
           break;
         }
       }
       if (!wholeWordPure) break;
+      // 28c Phase 1A: hard region span cap under mt-level-dispatch (G-1A2.0 fallback).
+      if (mtIsLevelDispatchMode() &&
+          (endWord + 1) - beginWord > MT_LEVEL_DISPATCH_REGION_SPAN_CAP) break;
       endWord ++;
     }
     int endCppId = endWord * ACTIVE_WIDTH;
@@ -4289,6 +4344,13 @@ int graph::genActivateMtHelpers(int serialFastSubStepMax, const std::string& ser
       } else if (isAlwaysActive(idx)) {
         emitBodyLock(indent + 1, "mtProfileRejectAlwaysActiveTask ++;\n");
       } else if (mtTasks[idx].taskKind != "pure_compute") {
+        // 28c Phase 1A: under mt-level-dispatch, distinguish worker0-only (forced
+        // serial by side-effect) from safe-serial that fell out of any region.
+        if (mtIsLevelDispatchMode() && hasWorker0OnlyReason(mtTasks[idx].serialReasons)) {
+          emitBodyLock(indent + 1, "mtProfileWorker0OnlyDispatched ++;\n");
+        } else if (mtIsLevelDispatchMode()) {
+          emitBodyLock(indent + 1, "mtProfileSafeSerialDispatched ++;\n");
+        }
         emitBodyLock(indent + 1, "mtProfileRejectSerialTask ++;\n");
       } else if (mtTaskHasSameActiveWordHazard(mtTasks, idx, globalConfig.MtRepCutLiteMode == "on")) {
         emitBodyLock(indent + 1, "mtProfileRejectSameActiveWordHazard ++;\n");
@@ -4314,7 +4376,9 @@ int graph::genActivateMtHelpers(int serialFastSubStepMax, const std::string& ser
 }
 
 void graph::genResetDef(SuperNode* super, bool isUIntReset, bool buffered, int resetId, int indent) {
-  std::string activeSinkType = globalConfig.MtHelperMode == "mt" ? "ActivationDelta" : "ActiveBuffer";
+  std::string activeSinkType = (globalConfig.MtHelperMode == "mt" ||
+                                globalConfig.MtHelperMode == "mt-level-dispatch")
+                                 ? "ActivationDelta" : "ActiveBuffer";
   if (buffered) emitBodyLock(indent ++, "void S%s::subReset%d(%s &nextActive){ // %s reset\n", name.c_str(), resetId, activeSinkType.c_str(), isUIntReset ? "uint" : "async");
   else emitBodyLock(indent ++, "void S%s::subReset%d(){ // %s reset\n", name.c_str(), resetId, isUIntReset ? "uint" : "async");
   std::string resetName = super->resetNode->type == NODE_REG_SRC ? RESET_NAME(super->resetNode).c_str() : super->resetNode->name.c_str();
@@ -4378,7 +4442,9 @@ void graph::genResetAll() {
     if (isUIntReset) super2ResetId[super->resetNode].first = resetId;
     else super2ResetId[super->resetNode].second = resetId;
     genResetDef(super, isUIntReset, false, resetId, 0);
-    if (globalConfig.MtHelperMode == "buffered-seq" || globalConfig.MtHelperMode == "mt") {
+    if (globalConfig.MtHelperMode == "buffered-seq" ||
+        globalConfig.MtHelperMode == "mt" ||
+        globalConfig.MtHelperMode == "mt-level-dispatch") {
       genResetDef(super, isUIntReset, true, resetId, 0);
     }
     resetSuper.push_back(super);
@@ -4526,7 +4592,8 @@ void graph::cppEmitter() {
 #endif
 
   /* class start*/
-  bool useMtHelpers = globalConfig.MtHelperMode == "mt";
+  bool useMtHelpers = globalConfig.MtHelperMode == "mt" ||
+                      globalConfig.MtHelperMode == "mt-level-dispatch";
   bool useSeqHelpers = globalConfig.MtHelperMode == "seq" ||
                        globalConfig.MtHelperMode == "buffered-seq";
   bool useBufferedHelpers = globalConfig.MtHelperMode == "buffered-seq" || useMtHelpers;
@@ -4567,6 +4634,8 @@ void graph::cppEmitter() {
   fprintf(header, "uint64_t mtProfileRejectNotActiveWhole;\n");
   fprintf(header, "uint64_t mtProfileRejectAlwaysActiveTask;\n");
   fprintf(header, "uint64_t mtProfileRejectSerialTask;\n");
+  fprintf(header, "uint64_t mtProfileSafeSerialDispatched;\n");      // 28c Phase 1A
+  fprintf(header, "uint64_t mtProfileWorker0OnlyDispatched;\n");     // 28c Phase 1A
   fprintf(header, "uint64_t mtProfileRejectDependencyEdge;\n");
   fprintf(header, "uint64_t mtProfileRejectSameActiveWordHazard;\n");
   fprintf(header, "uint64_t mtProfileRejectBelowMinBatch;\n");
@@ -4747,6 +4816,8 @@ void graph::cppEmitter() {
   emitBodyLock(1, "mtProfileRejectNotActiveWhole = 0;\n");
   emitBodyLock(1, "mtProfileRejectAlwaysActiveTask = 0;\n");
   emitBodyLock(1, "mtProfileRejectSerialTask = 0;\n");
+  emitBodyLock(1, "mtProfileSafeSerialDispatched = 0;\n");      // 28c Phase 1A
+  emitBodyLock(1, "mtProfileWorker0OnlyDispatched = 0;\n");     // 28c Phase 1A
   emitBodyLock(1, "mtProfileRejectDependencyEdge = 0;\n");
   emitBodyLock(1, "mtProfileRejectSameActiveWordHazard = 0;\n");
   emitBodyLock(1, "mtProfileRejectBelowMinBatch = 0;\n");
@@ -4849,6 +4920,7 @@ void graph::cppEmitter() {
   }
   emitBodyLock(1, "fprintf(stderr, \"[mt-profile] activation_delta entries=%%lu max_entries_per_worker=%%lu activate_all_count=%%lu\\n\", mtProfileActivationDeltaEntries, mtProfileActivationDeltaMaxEntriesPerWorker, mtProfileActivationDeltaActivateAllCount);\n");
   emitBodyLock(1, "fprintf(stderr, \"[mt-profile] rejection_reasons not_active_whole=%%lu always_active_task=%%lu serial_task=%%lu dependency_edge=%%lu same_active_word_hazard=%%lu below_min_batch=%%lu configured_single_worker=%%lu\\n\", mtProfileRejectNotActiveWhole, mtProfileRejectAlwaysActiveTask, mtProfileRejectSerialTask, mtProfileRejectDependencyEdge, mtProfileRejectSameActiveWordHazard, mtProfileRejectBelowMinBatch, mtProfileRejectConfiguredSingleWorker);\n");
+  emitBodyLock(1, "fprintf(stderr, \"[mt-profile] level_dispatch safe_serial_dispatched=%%lu worker0_only_dispatched=%%lu region_span_cap=%d\\n\", mtProfileSafeSerialDispatched, mtProfileWorker0OnlyDispatched);\n", MT_LEVEL_DISPATCH_REGION_SPAN_CAP);
   emitBodyLock(1, "fprintf(stderr, \"[mt-profile] batch_size_hist=%%lu,%%lu,%%lu,%%lu,%%lu,%%lu labels=1,2,3-4,5-8,9-15,16+\\n\", mtProfileBatchSizeHist[0], mtProfileBatchSizeHist[1], mtProfileBatchSizeHist[2], mtProfileBatchSizeHist[3], mtProfileBatchSizeHist[4], mtProfileBatchSizeHist[5]);\n");
   emitBodyLock(1, "fprintf(stderr, \"[mt-profile] effective_worker_count_hist=\");\n");
   emitBodyLock(1, "for (size_t i = 0; i < mtProfileEffectiveWorkerCountHist.size(); i ++) fprintf(stderr, \"%%s%%zu:%%lu\", i == 0 ? \"\" : \",\", i, mtProfileEffectiveWorkerCountHist[i]);\n");
