@@ -9,6 +9,9 @@
 #include "graph.h"
 
 #include <sstream>
+#include <string>
+#include <cerrno>
+#include <cstdint>
 #include <getopt.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
@@ -38,9 +41,23 @@ Config::Config() {
   DumpGraphJson = false;
   DumpAssignTree = false;
   DumpConstStatus = false;
+  DumpMtScheduleJson = false;
+  DumpMtRepCutLiteReport = false;
+  DumpMtCoarseRegionReport = false;
+  DisableReplicationOpt = false;
+  MtHelperMode = "off";
+  MtRepCutLiteMode = "off";
+  MtBatchFormationMode = "legacy";
+  MtCoarseRuntimeMode = "layered";
+  MtCoarseProfitabilityMode = "off";
+  MtCoarseWorkerPolicyMode = "static";
   OutputDir = ".";
+  InputBaseName = "";
   SuperNodeMaxSize = 35;
   cppMaxSizeKB = -1;
+  MtRepCutCopyBudget = 0;
+  MtRepCutFanoutBudget = 0;
+  MtActiveFrequencyCostThreshold = 2;
   sep_module = "$";
   sep_aggr = "$$";
   MergeWhenSize = 5;
@@ -61,6 +78,25 @@ static std::set<std::string> parseStageList(const std::string& arg) {
 
 static inline bool shouldDumpStage(const std::string& name) {
   return globalConfig.DumpStages.empty() || globalConfig.DumpStages.count(name);
+}
+
+static std::string basenameNoExt(const char* path) {
+  std::string name(path);
+  size_t slash = name.find_last_of("/");
+  if (slash != std::string::npos) name = name.substr(slash + 1);
+  size_t dot = name.find_last_of('.');
+  if (dot != std::string::npos) name = name.substr(0, dot);
+  return name;
+}
+
+static bool parseNonNegativeInt(const char* text, int& value) {
+  if (text == nullptr || text[0] == '\0') return false;
+  char* end = nullptr;
+  errno = 0;
+  long parsed = strtol(text, &end, 10);
+  if (errno != 0 || end == text || *end != '\0' || parsed < 0 || parsed > INT32_MAX) return false;
+  value = static_cast<int>(parsed);
+  return true;
 }
 
 
@@ -115,6 +151,27 @@ static void printUsage(const char* ProgName) {
             << "      --dump-stages=a,b,c          Dump only the listed stages (e.g., Init,TopoSort,AliasAnalysis).\n"
             << "      --dump-assign-tree           Include assignTree structure in JSON dump (can be large).\n"
             << "      --dump-const-status          Dump per-node constant-analysis status before removing constants.\n"
+            << "      --dump-mt-schedule-json      Dump gsim-mt schedule metadata JSON without changing generated model behavior.\n"
+            << "      --mt-helper-mode=off|seq|buffered-seq|mt\n"
+            << "                                      Emit gsim-mt per-super helpers; off is the default.\n"
+            << "                                      mt emits a bounded scan-order-preserving threaded helper runtime.\n"
+            << "      --mt-repcut-lite=off|on       Enable bounded RepCut-lite candidate selection; off is the default.\n"
+            << "      --mt-repcut-copy-budget=N     Total RepCut-lite copy cost budget; default 0.\n"
+            << "      --mt-repcut-fanout-budget=N   Per-candidate RepCut-lite fanout budget; default 0.\n"
+            << "      --mt-batch-formation=legacy|active-frequency|coarse\n"
+            << "                                      Select pure batch formation mode; legacy is default.\n"
+            << "      --mt-coarse-runtime=layered|mtask\n"
+            << "                                      Select coarse runtime lowering; layered preserves the 18X runtime.\n"
+            << "      --mt-coarse-profitability=off|static\n"
+            << "                                      Select conservative coarse admission/worker policy; off preserves 19X.\n"
+            << "      --mt-coarse-worker-policy=static|profitable\n"
+            << "                                      Select coarse MTask worker assignment policy; static preserves 20X.\n"
+            << "      --mt-active-frequency-cost-threshold=N\n"
+            << "                                      Minimum estimated released static cost for active-frequency batches; default 2.\n"
+            << "      --dump-mt-repcut-lite-report  Write a deterministic RepCut-lite candidate report JSON.\n"
+            << "      --dump-mt-coarse-region-report\n"
+            << "                                      Write a deterministic coarse-region report JSON.\n"
+            << "      --disable-replication-opt     Skip the existing gsim replicationOpt pass.\n"
             ;
 }
 
@@ -143,6 +200,19 @@ static char* parseCommandLine(int argc, char** argv) {
     OPT_DUMP_STAGES,
     OPT_DUMP_ASSIGN_TREE,
     OPT_DUMP_CONST_STATUS,
+    OPT_DUMP_MT_SCHEDULE_JSON,
+    OPT_MT_HELPER_MODE,
+    OPT_MT_REPCUT_LITE,
+    OPT_MT_REPCUT_COPY_BUDGET,
+    OPT_MT_REPCUT_FANOUT_BUDGET,
+    OPT_MT_BATCH_FORMATION,
+    OPT_MT_COARSE_RUNTIME,
+    OPT_MT_COARSE_PROFITABILITY,
+    OPT_MT_COARSE_WORKER_POLICY,
+    OPT_MT_ACTIVE_FREQUENCY_COST_THRESHOLD,
+    OPT_DUMP_MT_REPCUT_LITE_REPORT,
+    OPT_DUMP_MT_COARSE_REGION_REPORT,
+    OPT_DISABLE_REPLICATION_OPT,
   };
 
   const struct option Table[] = {
@@ -162,6 +232,19 @@ static char* parseCommandLine(int argc, char** argv) {
       {"dump-stages", required_argument, nullptr, 0},
       {"dump-assign-tree", no_argument, nullptr, 0},
       {"dump-const-status", no_argument, nullptr, 0},
+      {"dump-mt-schedule-json", no_argument, nullptr, 0},
+      {"mt-helper-mode", required_argument, nullptr, 0},
+      {"mt-repcut-lite", required_argument, nullptr, 0},
+      {"mt-repcut-copy-budget", required_argument, nullptr, 0},
+      {"mt-repcut-fanout-budget", required_argument, nullptr, 0},
+      {"mt-batch-formation", required_argument, nullptr, 0},
+      {"mt-coarse-runtime", required_argument, nullptr, 0},
+      {"mt-coarse-profitability", required_argument, nullptr, 0},
+      {"mt-coarse-worker-policy", required_argument, nullptr, 0},
+      {"mt-active-frequency-cost-threshold", required_argument, nullptr, 0},
+      {"dump-mt-repcut-lite-report", no_argument, nullptr, 0},
+      {"dump-mt-coarse-region-report", no_argument, nullptr, 0},
+      {"disable-replication-opt", no_argument, nullptr, 0},
       {nullptr, no_argument, nullptr, 0},
   };
 
@@ -222,10 +305,120 @@ static char* parseCommandLine(int argc, char** argv) {
                 case OPT_DUMP_CONST_STATUS:
                   globalConfig.DumpConstStatus = true;
                   break;
+                case OPT_DUMP_MT_SCHEDULE_JSON:
+                  globalConfig.DumpMtScheduleJson = true;
+                  break;
+                case OPT_MT_HELPER_MODE:
+                  globalConfig.MtHelperMode = optarg;
+                  if (globalConfig.MtHelperMode != "off" &&
+                      globalConfig.MtHelperMode != "seq" &&
+                      globalConfig.MtHelperMode != "buffered-seq" &&
+                      globalConfig.MtHelperMode != "mt") {
+                    fprintf(stderr, "Error: unknown --mt-helper-mode '%s' (expected off, seq, buffered-seq, or mt).\n", optarg);
+                    printUsage(argv[0]);
+                    std::cout.flush();
+                    fflush(nullptr);
+                    _exit(EXIT_FAILURE);
+                  }
+                  break;
+                case OPT_MT_REPCUT_LITE:
+                  globalConfig.MtRepCutLiteMode = optarg;
+                  if (globalConfig.MtRepCutLiteMode != "off" &&
+                      globalConfig.MtRepCutLiteMode != "on") {
+                    fprintf(stderr, "Error: unknown --mt-repcut-lite '%s' (expected off or on).\n", optarg);
+                    printUsage(argv[0]);
+                    std::cout.flush();
+                    fflush(nullptr);
+                    _exit(EXIT_FAILURE);
+                  }
+                  break;
+                case OPT_MT_REPCUT_COPY_BUDGET:
+                  if (!parseNonNegativeInt(optarg, globalConfig.MtRepCutCopyBudget)) {
+                    fprintf(stderr, "Error: invalid --mt-repcut-copy-budget '%s' (expected non-negative integer).\n", optarg);
+                    printUsage(argv[0]);
+                    std::cout.flush();
+                    fflush(nullptr);
+                    _exit(EXIT_FAILURE);
+                  }
+                  break;
+                case OPT_MT_REPCUT_FANOUT_BUDGET:
+                  if (!parseNonNegativeInt(optarg, globalConfig.MtRepCutFanoutBudget)) {
+                    fprintf(stderr, "Error: invalid --mt-repcut-fanout-budget '%s' (expected non-negative integer).\n", optarg);
+                    printUsage(argv[0]);
+                    std::cout.flush();
+                    fflush(nullptr);
+                    _exit(EXIT_FAILURE);
+                  }
+                  break;
+                case OPT_MT_BATCH_FORMATION:
+                  globalConfig.MtBatchFormationMode = optarg;
+                  if (globalConfig.MtBatchFormationMode != "legacy" &&
+                      globalConfig.MtBatchFormationMode != "active-frequency" &&
+                      globalConfig.MtBatchFormationMode != "coarse") {
+                    fprintf(stderr, "Error: unknown --mt-batch-formation '%s' (expected legacy, active-frequency, or coarse).\n", optarg);
+                    printUsage(argv[0]);
+                    std::cout.flush();
+                    fflush(nullptr);
+                    _exit(EXIT_FAILURE);
+                  }
+                  break;
+                case OPT_MT_COARSE_RUNTIME:
+                  globalConfig.MtCoarseRuntimeMode = optarg;
+                  if (globalConfig.MtCoarseRuntimeMode != "layered" &&
+                      globalConfig.MtCoarseRuntimeMode != "mtask") {
+                    fprintf(stderr, "Error: unknown --mt-coarse-runtime '%s' (expected layered or mtask).\n", optarg);
+                    printUsage(argv[0]);
+                    std::cout.flush();
+                    fflush(nullptr);
+                    _exit(EXIT_FAILURE);
+                  }
+                  break;
+                case OPT_MT_COARSE_PROFITABILITY:
+                  globalConfig.MtCoarseProfitabilityMode = optarg;
+                  if (globalConfig.MtCoarseProfitabilityMode != "off" &&
+                      globalConfig.MtCoarseProfitabilityMode != "static") {
+                    fprintf(stderr, "Error: unknown --mt-coarse-profitability '%s' (expected off or static).\n", optarg);
+                    printUsage(argv[0]);
+                    std::cout.flush();
+                    fflush(nullptr);
+                    _exit(EXIT_FAILURE);
+                  }
+                  break;
+                case OPT_MT_COARSE_WORKER_POLICY:
+                  globalConfig.MtCoarseWorkerPolicyMode = optarg;
+                  if (globalConfig.MtCoarseWorkerPolicyMode != "static" &&
+                      globalConfig.MtCoarseWorkerPolicyMode != "profitable") {
+                    fprintf(stderr, "Error: unknown --mt-coarse-worker-policy '%s' (expected static or profitable).\n", optarg);
+                    printUsage(argv[0]);
+                    std::cout.flush();
+                    fflush(nullptr);
+                    _exit(EXIT_FAILURE);
+                  }
+                  break;
+                case OPT_MT_ACTIVE_FREQUENCY_COST_THRESHOLD:
+                  if (!parseNonNegativeInt(optarg, globalConfig.MtActiveFrequencyCostThreshold)) {
+                    fprintf(stderr, "Error: invalid --mt-active-frequency-cost-threshold '%s' (expected non-negative integer).\n", optarg);
+                    printUsage(argv[0]);
+                    std::cout.flush();
+                    fflush(nullptr);
+                    _exit(EXIT_FAILURE);
+                  }
+                  break;
+                case OPT_DUMP_MT_REPCUT_LITE_REPORT:
+                  globalConfig.DumpMtRepCutLiteReport = true;
+                  break;
+                case OPT_DUMP_MT_COARSE_REGION_REPORT:
+                  globalConfig.DumpMtCoarseRegionReport = true;
+                  break;
+                case OPT_DISABLE_REPLICATION_OPT:
+                  globalConfig.DisableReplicationOpt = true;
+                  break;
                 default: printUsage(argv[0]); std::cout.flush(); fflush(nullptr); _exit(EXIT_SUCCESS);
               }
               break;
-      case 1: return optarg; // InputFileName
+      case 1:
+        globalConfig.InputBaseName = basenameNoExt(optarg);
+        return optarg; // InputFileName
       case 'd':
         globalConfig.EnableDumpGraph = true;
         globalConfig.DumpGraphDot = true;
@@ -320,7 +513,9 @@ int main(int argc, char** argv) {
 
   FUNC_WRAPPER(g->graphPartition(), "graphPartition");
 
-  FUNC_WRAPPER(g->replicationOpt(), "Replication");
+  if (!globalConfig.DisableReplicationOpt) {
+    FUNC_WRAPPER(g->replicationOpt(), "Replication");
+  }
 
   // FUNC_WRAPPER(g->mergeRegister(), "MergeRegister");
 

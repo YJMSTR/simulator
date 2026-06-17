@@ -5,6 +5,10 @@
 #ifndef GRAPH_H
 #define GRAPH_H
 
+struct MtRepCutClone;
+struct MtRepCutSemanticPlan;
+struct MtCoarseRegionPlan;
+
 class graph {
   FILE *srcFp;
   int srcFileIdx;
@@ -12,30 +16,38 @@ class graph {
 
   bool __emitSrc(int indent, bool canNewFile, bool alreadyEndFunc, const char *nextFuncDef, const char *fmt, ...);
   void emitPrintf();
-  void activateNext(Node* node, std::set<int>& nextNodeId, std::string oldName, bool inStep, std::string flagName, int indent);
-  void activateUncondNext(Node* node, std::set<int>& activateId, bool inStep, std::string flagName, int indent);
+  void activateNext(Node* node, std::set<int>& nextNodeId, std::string oldName, bool inStep, std::string flagName,
+                    std::string activeBufferName, int indent);
+  void activateUncondNext(Node* node, std::set<int>& activateId, bool inStep, std::string flagName,
+                          std::string activeBufferName, int indent);
 
   FILE* genHeaderStart();
   void genNodeDef(FILE* fp, Node* node);
   void genInterfaceInput(Node* input);
   void genInterfaceOutput(Node* output);
-  void genStep(int subStepIdxMax);
+  void genStep(int subStepIdxMax, int serialFastSubStepMax = -1, const std::string& serialFastSuffix = "");
   void genHeaderEnd(FILE* fp);
   int genNodeStepStart(SuperNode* node, uint64_t mask, int idx, std::string flagName, int indent);
   int genNodeStepEnd(SuperNode* node, int indent);
   void genMemInit(Node* node);
   void nodeDisplay(Node* member, int indent);
   void genMemRead(FILE* fp);
-  int genActivate();
+  int genActivate(const std::string& subStepSuffix = "");
   void genUpdateRegister(FILE* fp);
   void genMemWrite(FILE* fp);
   void saveDiffRegs();
   void genResetAll();
-  void genResetDef(SuperNode* super, bool isUIntReset, int indent);
+  void genResetDef(SuperNode* super, bool isUIntReset, bool buffered, int resetId, int indent);
   void genResetActivation(SuperNode* super, bool isUIntReset, int indent, int resetId);
   void genResetDecl(FILE* fp);
-  int translateInst(InstInfo inst, int indent, std::string flagName);
-  void genSuperEval(SuperNode* super, std::string flagName, int indent);
+  int translateInst(InstInfo inst, int indent, std::string flagName, std::string activeBufferName);
+  void genSuperEval(SuperNode* super, std::string flagName, std::string activeBufferName, int indent);
+  void genMtTaskHelper(SuperNode* super, bool buffered, const std::string& activeSinkType);
+  void genMtRepCutLiteTaskHelper(SuperNode* super, const std::vector<MtRepCutClone>& clones, const std::string& activeSinkType);
+  void genMtTaskRunner(const MtRepCutSemanticPlan& semanticPlan);
+  void genMtCoarseRegionRunner(const MtRepCutSemanticPlan& semanticPlan, const MtCoarseRegionPlan& coarsePlan);
+  int genActivateSeqHelpers(bool buffered);
+  int genActivateMtHelpers(int serialFastSubStepMax = -1, const std::string& serialFastSuffix = "");
   void removeNodesNoConnect(NodeStatus status);
   void reconnectSuper();
   void reconnectAll();
@@ -83,6 +95,9 @@ class graph {
   void topoSort();
   void instsGenerator();
   void cppEmitter();
+  void dumpMtScheduleJson();
+  void dumpMtRepCutLiteReport();
+  void dumpMtCoarseRegionReport();
   void usedBits();
   void traversal();
   void traversalNoTree();
