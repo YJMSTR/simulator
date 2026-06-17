@@ -4207,14 +4207,8 @@ int graph::genActivateMtHelpers(int serialFastSubStepMax, const std::string& ser
 
     emitFuncDecl(0, "void S%s::subStep0() {\n", name.c_str());
     int indent = 1;
-    if (serialFastSubStepMax >= 0) {
-      emitBodyLock(indent, "if (mtConfiguredWorkerCount <= 1 && !mtProfileEnabled) {\n");
-      for (int fastIdx = 0; fastIdx <= serialFastSubStepMax; fastIdx ++) {
-        emitBodyLock(indent + 1, "subStep%d%s();\n", fastIdx, serialFastSuffix.c_str());
-      }
-      emitBodyLock(indent + 1, "return;\n");
-      emitBodyLock(indent, "}\n");
-    }
+    (void)serialFastSubStepMax;
+    (void)serialFastSuffix;
     int nextSubStepIdx = 1;
     std::string nextFuncDef = format("void S%s::subStep%d()", name.c_str(), nextSubStepIdx);
     bool prevActiveWhole = false;
@@ -4398,7 +4392,7 @@ void graph::genResetAll() {
   emitBodyLock(0, "}\n");
 }
 
-void graph::genStep(int subStepIdxMax) {
+void graph::genStep(int subStepIdxMax, int serialFastSubStepMax, const std::string& serialFastSuffix) {
   emitFuncDecl(0, "void S%s::step() {\n", name.c_str());
   emitBodyLock(1, "std::chrono::steady_clock::time_point mtProfileStepBegin;\n");
   emitBodyLock(1, "if (mtProfileEnabled) mtProfileStepBegin = std::chrono::steady_clock::now();\n");
@@ -4409,6 +4403,15 @@ void graph::genStep(int subStepIdxMax) {
         emitBodyLock(1, "%s = %s;\n", RESET_NAME(member).c_str(), member->name.c_str());
       }
     }
+  }
+  if (serialFastSubStepMax >= 0) {
+    emitBodyLock(1, "if (mtConfiguredWorkerCount <= 1 && !mtProfileEnabled) {\n");
+    for (int i = 0; i <= serialFastSubStepMax; i ++) {
+      emitBodyLock(2, "subStep%d%s();\n", i, serialFastSuffix.c_str());
+    }
+    emitBodyLock(2, "cycles ++;\n");
+    emitBodyLock(2, "return;\n");
+    emitBodyLock(1, "}\n");
   }
   for (int i = 0; i <= subStepIdxMax; i ++) {
     emitBodyLock(1, "subStep%d();\n", i);
@@ -4951,7 +4954,7 @@ void graph::cppEmitter() {
 
   /* step wrapper */
   fprintf(header, "void step();\n");
-  genStep(subStepIdxMax);
+  genStep(subStepIdxMax, serialFastSubStepMax, serialFastSuffix);
 
   /* end of file */
   fprintf(header, "};\n"

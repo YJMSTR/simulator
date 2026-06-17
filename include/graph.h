@@ -25,7 +25,7 @@ class graph {
   void genNodeDef(FILE* fp, Node* node);
   void genInterfaceInput(Node* input);
   void genInterfaceOutput(Node* output);
-  void genStep(int subStepIdxMax);
+  void genStep(int subStepIdxMax, int serialFastSubStepMax = -1, const std::string& serialFastSuffix = "");
   void genHeaderEnd(FILE* fp);
   int genNodeStepStart(SuperNode* node, uint64_t mask, int idx, std::string flagName, int indent);
   int genNodeStepEnd(SuperNode* node, int indent);
